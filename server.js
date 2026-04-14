@@ -11,6 +11,7 @@ app.use((req, res, next) => {
   const origin = req.headers.origin || '';
   const allowed = [
     'https://trycueai.netlify.app',
+    'https://chegv.github.io',
     'http://localhost:3000',
     'http://localhost:8080',
   ];
