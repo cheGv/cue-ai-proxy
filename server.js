@@ -1,42 +1,49 @@
 const express = require('express');
-const cors = require('cors');
-const Anthropic = require('@anthropic-ai/sdk');
+const fetch = require('node-fetch');
 
-const app = express();
-// FIX: Using process.env.PORT for Railway, defaulting to 3001 for local dev
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const PORT = process.env.PORT || 3001;
 
-// Initialize Anthropic (Railway will provide the API Key via environment variables)
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
+const app = express();
+app.use(express.json({ limit: '2mb' }));
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin || '';
+  const allowed = [
+    'https://trycueai.netlify.app',
+    'http://localhost:3000',
+    'http://localhost:8080',
+  ];
+  if (allowed.includes(origin) || origin.startsWith('http://localhost')) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
 });
 
-// Middleware
-// The origin matches your Netlify URL
-app.use(cors({ origin: 'https://trycueai.netlify.app' }));
-app.use(express.json());
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'cue-proxy' }));
 
-// Health Check Endpoint (For Step 3 of your plan)
-app.get('/health', (req, res) => {
-  res.json({ status: "ok", service: "cue-proxy" });
-});
-
-// Report Generation Endpoint
 app.post('/generate-report', async (req, res) => {
   try {
-    const { prompt } = req.body;
-    const msg = await anthropic.messages.create({
-      model: "claude-3-5-sonnet-20240620",
-      max_tokens: 2000,
-      messages: [{ role: "user", content: prompt }],
+    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify(req.body),
     });
-    res.json(msg);
-  } catch (error) {
-    console.error("Proxy Error:", error);
-    res.status(500).json({ error: error.message });
+    const data = await upstream.json();
+    res.status(upstream.status).json(data);
+  } catch (err) {
+    console.error('Proxy error:', err);
+    res.status(502).json({ error: { message: `Proxy error: ${err.message}` } });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Proxy running on port ${PORT}`);
+  console.log(`Cue proxy listening on port ${PORT}`);
 });
