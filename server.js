@@ -27,6 +27,22 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'cue-proxy' }
 
 app.post('/generate-report', async (req, res) => {
   try {
+    const { clientName, session, additionalContext } = req.body;
+
+    const prompt = `You are an expert Speech-Language Pathologist. Generate a professional session note for the following:
+
+Client: ${clientName}
+Session Date: ${session?.date || 'Not specified'}
+Goal: ${session?.goal || 'Not specified'}
+Activity: ${session?.activity || 'Not specified'}
+Trials: ${session?.totalTrials || 0} attempts, ${session?.independentTrials || 0} independent, ${session?.promptedTrials || 0} prompted
+Goal Met: ${session?.goalMet ? 'Yes' : 'No'}
+Affect/Regulation: ${session?.affect || 'Not specified'}
+Notes: ${session?.notes || 'None'}
+${additionalContext ? 'Additional Context: ' + additionalContext : ''}
+
+Write a concise, professional session note suitable for a clinical record.`;
+
     const upstream = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -34,7 +50,11 @@ app.post('/generate-report', async (req, res) => {
         'x-api-key': ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify(req.body),
+      body: JSON.stringify({
+        model: 'claude-opus-4-5',
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: prompt }]
+      }),
     });
     const data = await upstream.json();
     res.status(upstream.status).json(data);
