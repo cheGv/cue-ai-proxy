@@ -30,19 +30,32 @@ app.post('/generate-report', async (req, res) => {
   try {
     const { clientName, session, additionalContext } = req.body;
 
-    const prompt = `You are an RCI-certified Speech-Language Pathologist. Generate a professional session note for the following:
+    const prompt = `You are an RCI-certified Speech-Language Pathologist writing a clinical session note.
 
+IMPORTANT FORMATTING RULES — follow exactly:
+- Plain text only. No markdown. No **, *, ##, or bullet dashes.
+- Use these four section headers exactly as shown, each on its own line followed by a colon, with the content on the next line:
+
+SUBJECTIVE:
+OBJECTIVE:
+ASSESSMENT:
+PLAN:
+
+- Separate sections with one blank line.
+- Write in full sentences. No bullet points. No bold or italic text.
+
+SESSION DATA:
 Client: ${clientName}
 Session Date: ${session?.date || 'Not specified'}
-Goal: ${session?.goal || 'Not specified'}
+Goal / Target Behaviour: ${session?.goal || 'Not specified'}
 Activity: ${session?.activity || 'Not specified'}
-Trials: ${session?.totalTrials || 0} attempts, ${session?.independentTrials || 0} independent, ${session?.promptedTrials || 0} prompted
-Goal Met: ${session?.goalMet ? 'Yes' : 'No'}
-Affect/Regulation: ${session?.affect || 'Not specified'}
-Notes: ${session?.notes || 'None'}
+Trials: ${session?.totalTrials || 0} total, ${session?.independentTrials || 0} independent, ${session?.promptedTrials || 0} prompted
+Goal Met: ${session?.goalMet || 'Not specified'}
+Affect / Regulation: ${session?.affect || 'Not specified'}
+Next Session Focus: ${session?.notes || 'None'}
 ${additionalContext ? 'Additional Context: ' + additionalContext : ''}
 
-Write a concise, professional session note suitable for a clinical record.`;
+Write the session note now using only the four SOAP sections above.`;
 
     const upstream = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
