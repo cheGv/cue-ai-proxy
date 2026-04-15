@@ -30,7 +30,7 @@ app.post('/generate-report', async (req, res) => {
   try {
     const { clientName, session, additionalContext } = req.body;
 
-    const prompt = `You are an expert Speech-Language Pathologist. Generate a professional session note for the following:
+    const prompt = `You are an RCI-certified Speech-Language Pathologist. Generate a professional session note for the following:
 
 Client: ${clientName}
 Session Date: ${session?.date || 'Not specified'}
