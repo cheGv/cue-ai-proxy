@@ -34,10 +34,16 @@ app.post('/generate-report', async (req, res) => {
     const date       = session?.date         || 'Not specified';
     const goal       = session?.goal         || 'Not specified';
     const activity   = session?.activity     || 'Not specified';
-    const attempts   = Number(session?.totalTrials       || 0);
-    const independent = Number(session?.independentTrials || 0);
-    const prompted   = Number(session?.promptedTrials    || 0);
+    const attempts   = session?.totalTrials       || 0;
+    const independent = session?.independentTrials || 0;
+    const prompted   = session?.promptedTrials    || 0;
     const goalMet    = session?.goalMet      || 'Not specified';
+
+    const totalTrials  = parseInt(attempts)   || 0;
+    const indepTrials  = parseInt(independent) || 0;
+    const promptTrials = parseInt(prompted)   || 0;
+    const indepPct     = totalTrials > 0 ? Math.round((indepTrials  / totalTrials) * 100) : 0;
+    const promptPct    = totalTrials > 0 ? Math.round((promptTrials / totalTrials) * 100) : 0;
     const affect     = session?.affect       || 'Not specified';
     const notes      = session?.notes        || 'None';
 
@@ -70,9 +76,9 @@ OBJECTIVE:
 Target Goal: ${goal}
 Activity: ${activity}
 Trial Data:
-- Total Trials: ${attempts}
-- Independent Responses: ${independent} (${attempts > 0 ? Math.round((independent / attempts) * 100) : 0}%)
-- Prompted Responses: ${prompted} (${attempts > 0 ? Math.round((prompted / attempts) * 100) : 0}%)
+- Total Trials: ${totalTrials}
+- Independent Responses: ${indepTrials} (${indepPct}%)
+- Prompted Responses: ${promptTrials} (${promptPct}%)
 - Goal Met: ${goalMet}
 Client Affect/Regulation: ${affect}
 
