@@ -1,24 +1,12 @@
-// routes/generateGoals.js
-// POST /api/generate-goals
-// Reads client chart from Supabase, calls Claude, writes goal plan back atomically.
-//
-// Drop into your existing Express server:
-//   const generateGoals = require('./routes/generateGoals');
-//   app.use('/api', generateGoals);
-
 const express = require('express');
 const router = express.Router();
+const fetch = require('node-fetch');
 const { createClient } = require('@supabase/supabase-js');
-const Anthropic = require('@anthropic-ai/sdk');
 
-// ── env vars (already set on Render) ──────────────────────────────────────────
-const SUPABASE_URL      = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE  = process.env.SUPABASE_SERVICE_ROLE_KEY; // service key — bypasses RLS for server writes
-const ANTHROPIC_KEY     = process.env.ANTHROPIC_API_KEY;
+const SUPABASE_URL     = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const ANTHROPIC_KEY    = process.env.ANTHROPIC_API_KEY;
 
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
-
-// ── system prompt ─────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are Cue's clinical reasoning layer, co-authoring a treatment goal plan for a speech-language pathologist. You are an assistant, not a decision-maker. The clinician reviews and attests every plan you produce.
 
 YOUR CLINICAL CASCADE — think in this order, always:
@@ -29,43 +17,38 @@ Step 2 — Communicative intent profile: Which functions are present (request, p
 
 Step 3 — Language processing pathway: Gestalt (NLA/Blanc) or analytic? If GLP, which NLA stage? If analytic, what morphosyntactic level and productive vocabulary size?
 
-Step 4 — Modality and motor planning: Primary expressive modality? If AAC: symbolic level, vocabulary size, access method, modelling exposure. If verbal: motor speech indicators — linguistic vs phonological vs motor planning/execution barrier (PROMPT framework: DTTC/NTC hierarchy indicators).
+Step 4 — Modality and motor planning: Primary expressive modality? If AAC: symbolic level, vocabulary size, access method, modelling exposure. If verbal: motor speech indicators — linguistic vs phonological vs motor planning barrier (PROMPT framework).
 
 Step 5 — Goal prioritisation: (1) Regulatory dysregulation primary → LTG 1 = regulation + communication co-occurrence. (2) Intent emerging, regulation adequate → LTG 1 = intent expansion. (3) Intent present, form limiting → LTG 1 = modality/motor planning. AAC always gets its own LTG if it is the primary modality.
 
 NEURODIVERSITY-AFFIRMING CONSTRAINTS — hard rules, any violation is a critical failure:
 NEVER include: "reduce stimming", "increase eye contact", "decrease non-compliance", "reduce echolalic language", "normalise", "respond correctly", "appropriate behaviour".
-ALWAYS frame goals as expansion of repertoire, adding modality not replacing, increasing access not reducing expression, co-regulation as scaffold not prerequisite.
+ALWAYS frame goals as expansion of repertoire, adding modality not replacing, increasing access not reducing expression.
 
-INSUFFICIENT DATA PROTOCOL: If fewer than 3 clinical sessions AND no formal assessment present, set router_confidence to "low", framework_router to "generic_fallback", populate data_gaps with specific missing observations, produce maximum 1 LTG.
-Minimum for high confidence: 3+ sessions OR 1 formal assessment, age confirmed, primary modality documented, at least 1 regulatory observation.
+INSUFFICIENT DATA PROTOCOL: If fewer than 3 clinical sessions AND no formal assessment, set router_confidence to "low", framework_router to "generic_fallback", populate data_gaps, produce maximum 1 LTG.
 
 OUTPUT: Return ONLY valid JSON — no preamble, no markdown fences, no text outside the JSON object.
 
-Required JSON structure:
 {
-  "framework_router": "regulatory_asd" or "generic_fallback",
-  "router_confidence": "high" or "low",
-  "data_sources": ["brief description of each source used"],
-  "reasoning_trace": "single prose paragraph 150-220 words, third person, clinical register, no bullet points",
-  "data_gaps": null or ["list of specific missing observations needed"],
+  "framework_router": "regulatory_asd or generic_fallback",
+  "router_confidence": "high or low",
+  "data_sources": ["brief description of each source"],
+  "reasoning_trace": "single prose paragraph 150-220 words, third person, clinical register, no bullets",
+  "data_gaps": null,
   "goals": [
     {
       "sequence_num": 1,
       "category": "regulatory_communicative | language_development | aac_modality | motor_speech | pragmatics",
       "domain": "short clinical domain label",
-      "title": "one sentence active voice — what the child WILL DO",
-      "goal_text": "full SMART LTG with measurable criterion, generalisation context, time frame beginning with Within N weeks",
+      "title": "one sentence active voice what child WILL DO",
+      "goal_text": "full SMART LTG with criterion, generalisation context, time frame beginning with Within N weeks",
       "time_frame_weeks": 12,
-      "evidence_rationale": "2-3 sentences citing specific sessions or assessments by name/date",
+      "evidence_rationale": "2-3 sentences citing specific sessions or assessments",
       "evidence_tags": [
-        {
-          "framework_name": "framework name e.g. Polyvagal Theory (Porges), NLA Stage 2-3 (Blanc), ImPACT, Hanen More Than Words, PROMPT DTTC, Aided Language Stimulation (Goossens), Kelly Mahler Interoception, SCERTS",
-          "rationale": "one sentence why this framework applies to this child for this goal"
-        }
+        {"framework_name": "framework name", "rationale": "one sentence why this applies"}
       ],
       "short_term_goals": [
-        {"sequence_num": 1, "specific": "what will be observed/measured", "measurable": "criterion X/Y or X%", "target_accuracy": 80, "time_bound_sessions": 8},
+        {"sequence_num": 1, "specific": "what will be observed", "measurable": "criterion", "target_accuracy": 80, "time_bound_sessions": 8},
         {"sequence_num": 2, "specific": "...", "measurable": "...", "target_accuracy": 80, "time_bound_sessions": 10},
         {"sequence_num": 3, "specific": "...", "measurable": "...", "target_accuracy": 80, "time_bound_sessions": 12}
       ]
@@ -73,27 +56,15 @@ Required JSON structure:
   ]
 }
 
-Goal count rules: minimum 2 LTGs, maximum 3 LTGs. Exactly 3 STOs per LTG. STOs must sequence as scaffold → criterion → generalisation.`;
-
-// ── request body schema ───────────────────────────────────────────────────────
-// {
-//   client_id: string,
-//   clarifying_answers: {
-//     processor_type: "gestalt" | "analytic" | "unknown",
-//     aac_primary: boolean,
-//     regulation_first: boolean
-//   }
-// }
+Rules: 2-3 LTGs, exactly 3 STOs each, STOs sequence scaffold to criterion to generalisation.`;
 
 router.post('/generate-goals', async (req, res) => {
-  // 1. Auth — verify Supabase JWT from Authorization header
   const authHeader = req.headers['authorization'];
   if (!authHeader?.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Missing authorization header' });
   }
   const token = authHeader.split(' ')[1];
 
-  // Use service client for writes, but verify user identity first
   const userClient = createClient(SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
     global: { headers: { Authorization: `Bearer ${token}` } }
   });
@@ -108,12 +79,10 @@ router.post('/generate-goals', async (req, res) => {
     return res.status(400).json({ error: 'client_id and clarifying_answers are required' });
   }
 
-  // Service client for all DB operations (bypasses RLS — we've already verified the user)
   const db = createClient(SUPABASE_URL, SUPABASE_SERVICE);
 
   try {
-    // 2. Pull chart data from Supabase
-    const [clientRes, sessionsRes, assessmentsRes] = await Promise.all([
+    const [clientRes, sessionsRes, goalsRes] = await Promise.all([
       db.from('clients').select('*').eq('id', client_id).single(),
       db.from('clinical_sessions')
         .select('id, session_date, soap_note, session_summary, goals_addressed')
@@ -130,16 +99,13 @@ router.post('/generate-goals', async (req, res) => {
 
     const client = clientRes.data;
     const sessions = sessionsRes.data || [];
-    const existingGoals = assessmentsRes.data || [];
+    const existingGoals = goalsRes.data || [];
 
-    // 3. Build the input payload for Claude
-    // Derive age_years / age_months from date_of_birth if available, fall back to age integer
     let ageYears = null, ageMonths = null;
     if (client.date_of_birth) {
       const dob = new Date(client.date_of_birth);
       const now = new Date();
-      const totalMonths =
-        (now.getFullYear() - dob.getFullYear()) * 12 + (now.getMonth() - dob.getMonth());
+      const totalMonths = (now.getFullYear() - dob.getFullYear()) * 12 + (now.getMonth() - dob.getMonth());
       ageYears = Math.floor(totalMonths / 12);
       ageMonths = totalMonths % 12;
     } else if (client.age) {
@@ -152,64 +118,51 @@ router.post('/generate-goals', async (req, res) => {
         age_years: ageYears,
         age_months: ageMonths,
         diagnosis: client.diagnosis ?? null,
-        // languages[] column back-filled from primary_language; fall back gracefully
-        languages: client.languages?.length
-          ? client.languages
-          : client.primary_language
-            ? [client.primary_language]
-            : [],
-        // aac_status column added in migration; uses_aac boolean as fallback
-        aac_status: client.aac_status
-          ?? (client.uses_aac ? 'emerging' : 'none'),
-        aac_device: client.aac_device ?? null,
+        languages: client.languages?.length ? client.languages : client.primary_language ? [client.primary_language] : [],
+        aac_status: client.aac_status ?? (client.uses_aac ? 'emerging' : 'none'),
         communication_modality: client.communication_modality ?? null
       },
       clarifying_answers,
       session_notes: sessions.map(s => {
         const date = s.session_date ? `(${s.session_date})` : '';
-        return [s.soap_note, s.session_summary, s.goals_addressed]
-          .filter(Boolean)
-          .join(' ')
-          .trim() || `Session ${date}: No notes recorded`;
+        return [s.soap_note, s.session_summary, s.goals_addressed].filter(Boolean).join(' ').trim() || `Session ${date}: No notes recorded`;
       }),
-      assessments: existingGoals.length
-        ? [`Existing active goals: ${existingGoals.map(g => g.goal_text).join('; ')}`]
-        : [],
+      assessments: existingGoals.length ? [`Existing active goals: ${existingGoals.map(g => g.goal_text).join('; ')}`] : [],
       intake_notes: client.additional_notes ?? null,
       clinician_hypothesis: req.body.clinician_hypothesis ?? null
     };
 
-    // Flag low confidence early if data is thin
-    const sessionCount = sessions.filter(s => s.soap_note || s.session_summary).length;
-    if (sessionCount < 3) {
-      chartPayload._data_warning = `Only ${sessionCount} sessions with notes available`;
-    }
-
-    // 4. Call Claude
-    const claudeRes = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 4000,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: JSON.stringify(chartPayload) }]
+    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 4000,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: JSON.stringify(chartPayload) }]
+      })
     });
 
-    const rawText = claudeRes.content?.[0]?.text ?? '';
+    if (!claudeRes.ok) {
+      const errBody = await claudeRes.text();
+      throw new Error(`Claude API error ${claudeRes.status}: ${errBody.slice(0, 200)}`);
+    }
 
-    // 5. Parse JSON — strip any accidental fences
+    const claudeData = await claudeRes.json();
+    const rawText = claudeData.content?.[0]?.text ?? '';
+
     let plan;
     try {
       const clean = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
       plan = JSON.parse(clean);
-    } catch (parseErr) {
-      console.error('Claude JSON parse failure:', rawText.slice(0, 500));
-      return res.status(502).json({
-        error: 'Claude returned malformed JSON',
-        raw_preview: rawText.slice(0, 300)
-      });
+    } catch (e) {
+      return res.status(502).json({ error: 'Claude returned malformed JSON', raw_preview: rawText.slice(0, 300) });
     }
 
-    // 6. Write to Supabase atomically
-    // 6a. Insert goal_plan
     const { data: planRow, error: planErr } = await db
       .from('goal_plans')
       .insert({
@@ -230,9 +183,7 @@ router.post('/generate-goals', async (req, res) => {
     const planId = planRow.id;
     const insertedGoals = [];
 
-    // 6b. Insert each LTG + STOs + evidence tags
     for (const goal of (plan.goals ?? [])) {
-      // Insert LTG
       const { data: ltgRow, error: ltgErr } = await db
         .from('long_term_goals')
         .insert({
@@ -249,15 +200,13 @@ router.post('/generate-goals', async (req, res) => {
           original_text: goal.goal_text,
           evidence_rationale: goal.evidence_rationale,
           status: 'active',
-          target_date: new Date(Date.now() + (goal.time_frame_weeks ?? 12) * 7 * 24 * 60 * 60 * 1000)
-            .toISOString().split('T')[0]
+          target_date: new Date(Date.now() + (goal.time_frame_weeks ?? 12) * 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
         })
         .select()
         .single();
 
       if (ltgErr) throw new Error(`long_term_goals insert failed: ${ltgErr.message}`);
 
-      // Insert STOs
       const stoRows = (goal.short_term_goals ?? []).map(sto => ({
         long_term_goal_id: ltgRow.id,
         client_id: String(client_id),
@@ -277,7 +226,6 @@ router.post('/generate-goals', async (req, res) => {
         if (stoErr) throw new Error(`short_term_goals insert failed: ${stoErr.message}`);
       }
 
-      // Insert evidence tags
       const tagRows = (goal.evidence_tags ?? []).map(tag => ({
         ltg_id: ltgRow.id,
         framework_name: tag.framework_name,
@@ -292,7 +240,6 @@ router.post('/generate-goals', async (req, res) => {
       insertedGoals.push({ ...ltgRow, short_term_goals: stoRows, evidence_tags: tagRows });
     }
 
-    // 7. Return the full plan to Flutter
     return res.status(201).json({
       plan_id: planId,
       framework_router: plan.framework_router,
@@ -309,16 +256,13 @@ router.post('/generate-goals', async (req, res) => {
   }
 });
 
-// ── Attest a plan ─────────────────────────────────────────────────────────────
-// POST /api/attest-goals
-// { plan_id: string, rci_number: string }
-// Immutable — no update or delete ever possible via RLS.
 router.post('/attest-goals', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader?.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Missing authorization header' });
   }
   const token = authHeader.split(' ')[1];
+
   const userClient = createClient(SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
     global: { headers: { Authorization: `Bearer ${token}` } }
   });
@@ -333,14 +277,9 @@ router.post('/attest-goals', async (req, res) => {
 
   const db = createClient(SUPABASE_URL, SUPABASE_SERVICE);
 
-  // Fetch full plan snapshot for immutable record
   const [planRes, ltgRes] = await Promise.all([
     db.from('goal_plans').select('*').eq('id', plan_id).eq('user_id', user.id).single(),
-    db.from('long_term_goals').select(`
-      *, 
-      short_term_goals(*),
-      goal_evidence_tags(*)
-    `).eq('plan_id', plan_id)
+    db.from('long_term_goals').select('*, short_term_goals(*), goal_evidence_tags(*)').eq('plan_id', plan_id)
   ]);
 
   if (planRes.error || !planRes.data) {
@@ -349,15 +288,9 @@ router.post('/attest-goals', async (req, res) => {
 
   const snapshot = { plan: planRes.data, goals: ltgRes.data ?? [] };
 
-  // Insert attestation (immutable by RLS — no UPDATE/DELETE policies exist)
   const { data: attestation, error: attestErr } = await db
     .from('goal_attestations')
-    .insert({
-      plan_id,
-      user_id: user.id,
-      rci_number,
-      plan_snapshot: snapshot
-    })
+    .insert({ plan_id, user_id: user.id, rci_number, plan_snapshot: snapshot })
     .select()
     .single();
 
@@ -365,7 +298,6 @@ router.post('/attest-goals', async (req, res) => {
     return res.status(500).json({ error: `Attestation failed: ${attestErr.message}` });
   }
 
-  // Activate the plan
   await db.from('goal_plans').update({ status: 'active' }).eq('id', plan_id);
 
   return res.status(201).json({
