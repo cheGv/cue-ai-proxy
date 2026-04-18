@@ -14,12 +14,14 @@ app.use((req, res, next) => {
     'https://chegv.github.io',
     'http://localhost:3000',
     'http://localhost:8080',
+    'http://localhost:50625',
+    'http://localhost:5000',
   ];
   if (allowed.includes(origin) || origin.startsWith('http://localhost')) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
