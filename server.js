@@ -28,7 +28,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'cue-proxy' }
 
 app.post('/generate-report', async (req, res) => {
   try {
-    const { clientName, session, additionalContext } = req.body;
+    const { clientName, session, additionalContext, goals } = req.body;
 
     const name       = clientName || 'Client';
     const date       = session?.date         || 'Not specified';
@@ -46,6 +46,11 @@ app.post('/generate-report', async (req, res) => {
     const promptPct    = totalTrials > 0 ? Math.round((promptTrials / totalTrials) * 100) : 0;
     const affect     = session?.affect       || 'Not specified';
     const notes      = session?.notes        || 'None';
+    const goalsText = goals && goals.length > 0
+  ? `\n\nACTIVE THERAPY GOALS:\n${goals.map(g => 
+      `- [${g.domain}] ${g.goal} (target: ${g.target})`
+    ).join('\n')}`
+  : '';
 
     const prompt = `You are Cue, a clinical AI assistant for RCI-certified Speech-Language Pathologists in India. Generate a professional two-page clinical report from the session data below.
 
@@ -58,7 +63,7 @@ INDEPENDENT RESPONSES: ${independent}
 PROMPTED RESPONSES: ${prompted}
 GOAL MET: ${goalMet}
 AFFECT/REGULATION: ${affect}
-NEXT SESSION FOCUS: ${notes}
+NEXT SESSION FOCUS: ${notes}${goalsText}
 
 Generate the report in this exact format with these exact headers. Use plain text only — no asterisks, no hashtags, no markdown.
 
