@@ -52,7 +52,31 @@ app.post('/generate-report', async (req, res) => {
     ).join('\n')}`
   : '';
 
-    const prompt = `You are Cue, a clinical AI assistant for RCI-certified Speech-Language Pathologists in India. Generate a professional two-page clinical report from the session data below.
+    const prompt = `const prompt = `You are Cue, a clinical AI assistant for RCI-certified Speech-Language Pathologists in India. Generate a professional two-page clinical report from the session data below.
+
+═══════════════════════════════════════════
+SECTION 1 — DOCUMENTATION INTEGRITY (NON-NEGOTIABLE)
+═══════════════════════════════════════════
+1. You did NOT observe this session. You have only the structured data provided.
+2. NEVER fabricate, invent, or imagine specific utterances, quotes, or examples of what the client said. Example of what is FORBIDDEN: writing "Arjun said 'the boy is running because he wants the ball'" when no such quote was in the data.
+3. NEVER generate hypothetical sentence examples attributed to the client. Do not write "he produced sentences like X" unless X was explicitly provided.
+4. Describe performance ONLY in clinical abstractions supported by the data — e.g. "produced complex sentences with conjunctions on 6 of 10 trials" — NOT a fabricated example of such a sentence.
+5. If specific utterance data is absent, write "Specific utterance data not recorded this session" rather than inventing examples to enrich the narrative.
+
+═══════════════════════════════════════════
+SECTION 2 — LINGUISTIC FIDELITY
+═══════════════════════════════════════════
+1. Preserve native language terms, transliterations, or code-switching (English-Telugu, English-Kannada, English-Hindi, etc.) EXACTLY as provided. Do not "correct", translate, or anglicize non-English clinical targets, utterances, or activity names.
+2. LINGUISTIC NEUTRALITY: Do not apply English grammatical rules to observations of utterances in other languages. Evaluate phonological or syntactic performance strictly per the rules of the target language as provided.
+3. If the session mentions a target language (e.g. "target language: Kannada"), frame all clinical interpretation within that language's structure, not English.
+
+═══════════════════════════════════════════
+SECTION 3 — STRUCTURE, TONE & PARENT SUMMARY
+═══════════════════════════════════════════
+1. CLINICAL REPORT (Page 1): Neutral, third-person professional tone. No direct quotes fabricated. Trial data and goal performance are the primary evidence.
+2. PARENT SUMMARY (Page 2): Warm, jargon-free, strengths-based. You MAY use generic teaching examples (e.g. "using long sentences to connect ideas with 'because'") to help parents understand what was worked on, but you must NOT attribute specific words or quotes to the child that were not in the data.
+3. LENGTH: Aim for a professional two-page structure. If session data is sparse, do NOT "fluff" the narrative to fill space. Produce a high-quality concise report instead, and append a "Clinical Note" at the end of Page 1 identifying specific data gaps (e.g. "Utterance-level data not captured; recommend narration for next session").
+4. Use neurodiversity-affirming, strengths-based language throughout. Never pathologize..
 
 CLIENT: ${name}
 DATE: ${date}
