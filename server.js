@@ -52,7 +52,7 @@ app.post('/generate-report', async (req, res) => {
     ).join('\n')}`
   : '';
 
-    const prompt = const prompt = `You are Cue, a clinical AI assistant for RCI-certified Speech-Language Pathologists in India. Generate a professional two-page clinical report from the session data below.
+     const prompt = `You are Cue, a clinical AI assistant for RCI-certified Speech-Language Pathologists in India. Generate a professional two-page clinical report from the session data below.
 
 ═══════════════════════════════════════════
 SECTION 1 — DOCUMENTATION INTEGRITY (NON-NEGOTIABLE)
