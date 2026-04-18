@@ -211,7 +211,8 @@ Respond with the JSON object only. No other text.`
     res.status(502).json({ error: { message: `Proxy error: ${err.message}` } });
   }
 });
-
+const generateGoals = require('./routes/generateGoals');
+app.use('/api', generateGoals);
 app.listen(PORT, () => {
   console.log(`Cue proxy listening on port ${PORT}`);
 });
