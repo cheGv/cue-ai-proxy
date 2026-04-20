@@ -1,3 +1,4 @@
+require('dotenv').config({ override: true });
 const express = require('express');
 const fetch = require('node-fetch');
 
@@ -202,6 +203,33 @@ Respond with the JSON object only. No other text.`
     res.status(502).json({ error: { message: `Proxy error: ${err.message}` } });
   }
 });
+app.post('/pre-session-brief', async (req, res) => {
+  try {
+    const { model, system, user_message } = req.body;
+
+    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: model || 'claude-sonnet-4-20250514',
+        max_tokens: 1024,
+        system: system,
+        messages: [{ role: 'user', content: user_message }],
+      }),
+    });
+
+    const data = await upstream.json();
+    res.status(upstream.status).json(data);
+  } catch (err) {
+    console.error('Pre-session brief error:', err);
+    res.status(502).json({ error: { message: `Proxy error: ${err.message}` } });
+  }
+});
+
 const generateGoals = require('./routes/generateGoals');
 app.use('/api', generateGoals);
 app.listen(PORT, () => {
