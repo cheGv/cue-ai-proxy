@@ -240,7 +240,9 @@ app.post('/extract', async (req, res) => {
     // file_base64 + file_type are optional — omit both for text-only (voice) extraction
     const contentBlocks = [];
 
-    if (file_type === 'application/pdf') {
+    if (!file_type) {
+      // Text-only (voice / brain dump) — no file block needed
+    } else if (file_type === 'application/pdf') {
       // Native PDF document block — Claude reads it directly
       contentBlocks.push({
         type: 'document',
