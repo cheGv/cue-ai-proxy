@@ -6,7 +6,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const PORT = process.env.PORT || 3001;
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '20mb' }));
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -227,6 +227,90 @@ app.post('/pre-session-brief', async (req, res) => {
   } catch (err) {
     console.error('Pre-session brief error:', err);
     res.status(502).json({ error: { message: `Proxy error: ${err.message}` } });
+  }
+});
+
+// ── /extract — file-aware clinical data extraction ────────────────────────────
+// Accepts PDF, image/*, or DOCX (via mammoth). Builds the appropriate
+// Anthropic content block type and returns { result: "..." }.
+app.post('/extract', async (req, res) => {
+  try {
+    const { model, system, user_message, file_base64, file_type } = req.body;
+
+    if (!file_base64 || !file_type) {
+      return res.status(400).json({ error: 'file_base64 and file_type are required' });
+    }
+
+    const contentBlocks = [];
+
+    if (file_type === 'application/pdf') {
+      // Native PDF document block — Claude reads it directly
+      contentBlocks.push({
+        type: 'document',
+        source: { type: 'base64', media_type: 'application/pdf', data: file_base64 },
+      });
+    } else if (file_type.startsWith('image/')) {
+      // Image block
+      contentBlocks.push({
+        type: 'image',
+        source: { type: 'base64', media_type: file_type, data: file_base64 },
+      });
+    } else if (file_type.includes('wordprocessingml') || file_type.includes('docx')) {
+      // DOCX: extract plain text with mammoth, then send as text block
+      try {
+        const mammoth = require('mammoth');
+        const buf = Buffer.from(file_base64, 'base64');
+        const extracted = await mammoth.extractRawText({ buffer: buf });
+        contentBlocks.push({
+          type: 'text',
+          text: `Document content:\n\n${extracted.value}`,
+        });
+      } catch (_) {
+        // mammoth unavailable or parse failure — tell the model what arrived
+        contentBlocks.push({
+          type: 'text',
+          text: '[A Word document was uploaded but could not be parsed. Extract what you can from context.]',
+        });
+      }
+    } else {
+      contentBlocks.push({ type: 'text', text: `[File of type ${file_type} provided]` });
+    }
+
+    // Append the instruction as the final text block
+    contentBlocks.push({ type: 'text', text: user_message });
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    };
+    // PDF support requires the beta header on current API versions
+    if (file_type === 'application/pdf') {
+      headers['anthropic-beta'] = 'pdfs-2024-09-25';
+    }
+
+    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: model || 'claude-opus-4-5',
+        max_tokens: 2048,
+        system: system,
+        messages: [{ role: 'user', content: contentBlocks }],
+      }),
+    });
+
+    const data = await upstream.json();
+    if (!upstream.ok) {
+      return res.status(500).json({ error: data?.error?.message || 'Anthropic API error' });
+    }
+
+    const resultText = data?.content?.[0]?.text ?? '';
+    res.json({ result: resultText });
+
+  } catch (err) {
+    console.error('Extract error:', err);
+    res.status(500).json({ error: err.message || 'Extraction failed' });
   }
 });
 
