@@ -306,7 +306,9 @@ app.post('/extract', async (req, res) => {
     res.json({ result: resultText });
 
   } catch (err) {
-    console.error('Extract error:', err);
+    console.error('Extract error — message:', err.message);
+    console.error('Extract error — stack:', err.stack);
+    console.error('Extract error — full:', err);
     res.status(500).json({ error: err.message || 'Extraction failed' });
   }
 });
