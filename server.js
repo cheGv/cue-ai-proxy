@@ -237,6 +237,14 @@ app.post('/extract', async (req, res) => {
   try {
     const { model, system, user_message, file_base64, file_type } = req.body;
 
+    // Guard: if a file_type is declared, base64 payload must be present and non-empty.
+    // Without this check an empty data field reaches Anthropic and causes a 422 that
+    // logs nowhere (it is caught by !upstream.ok, not the catch block).
+    if (file_type && (!file_base64 || file_base64.trim() === '')) {
+      console.error('[/extract] file_type set but file_base64 is empty/missing — rejecting before Anthropic call. file_type:', file_type);
+      return res.status(400).json({ error: 'file_base64 is required when file_type is provided' });
+    }
+
     // file_base64 + file_type are optional — omit both for text-only (voice) extraction
     const contentBlocks = [];
 
@@ -301,6 +309,11 @@ app.post('/extract', async (req, res) => {
 
     const data = await upstream.json();
     if (!upstream.ok) {
+      console.error('[/extract] Anthropic API error — status:', upstream.status,
+        '| type:', data?.error?.type,
+        '| message:', data?.error?.message,
+        '| file_type:', file_type,
+        '| base64_length:', file_base64 ? file_base64.length : 0);
       return res.status(500).json({ error: data?.error?.message || 'Anthropic API error' });
     }
 
