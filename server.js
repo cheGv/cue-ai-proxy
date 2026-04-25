@@ -237,10 +237,7 @@ app.post('/extract', async (req, res) => {
   try {
     const { model, system, user_message, file_base64, file_type } = req.body;
 
-    if (!file_base64 || !file_type) {
-      return res.status(400).json({ error: 'file_base64 and file_type are required' });
-    }
-
+    // file_base64 + file_type are optional — omit both for text-only (voice) extraction
     const contentBlocks = [];
 
     if (file_type === 'application/pdf') {
