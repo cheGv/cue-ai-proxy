@@ -9,6 +9,7 @@
   "dependencies": {
     "@deepgram/sdk": "^5.1.0",
     "@supabase/supabase-js": "^2.39.0",
+    "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^4.18.2",
     "mammoth": "^1.8.0",

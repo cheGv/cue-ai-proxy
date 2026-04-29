@@ -1,24 +1,25 @@
 require('dotenv').config({ override: true });
 const express = require('express');
-const fetch = require('node-fetch');
+const cors    = require('cors');
+const fetch   = require('node-fetch');
 const { WebSocketServer } = require('ws');
 const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
-
+const DEEPGRAM_API_KEY  = process.env.DEEPGRAM_API_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const PORT = process.env.PORT || 3001;
+const PORT              = process.env.PORT || 3001;
 
 const app = express();
-app.use(express.json({ limit: '20mb' }));
 
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
+// ── CORS — must be first, before all routes ───────────────────────────────────
+app.use(cors({
+  origin:         '*',
+  methods:        ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials:    false,
+}));
+
+app.use(express.json({ limit: '20mb' }));
 
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'cue-proxy' }));
 
@@ -357,15 +358,17 @@ const server = app.listen(PORT, () => {
 // We relay to Deepgram and forward transcript events back to Flutter as JSON.
 const wss = new WebSocketServer({ noServer: true });
 
-server.on('upgrade', (req, socket, head) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  if (url.pathname !== '/transcribe') {
+server.on('upgrade', (request, socket, head) => {
+  console.log('[upgrade] request to:', request.url);
+  const pathname = new URL(request.url, `http://${request.headers.host}`).pathname;
+
+  if (pathname === '/transcribe') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else {
     socket.destroy();
-    return;
   }
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit('connection', ws, req);
-  });
 });
 
 wss.on('connection', (clientWs) => {
