@@ -4,6 +4,7 @@ const cors    = require('cors');
 const fetch   = require('node-fetch');
 const { WebSocketServer } = require('ws');
 const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
+console.log('[boot] deepgram createClient type:', typeof createClient);
 
 const DEEPGRAM_API_KEY  = process.env.DEEPGRAM_API_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
