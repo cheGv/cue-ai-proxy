@@ -3,8 +3,8 @@ const express = require('express');
 const cors    = require('cors');
 const fetch   = require('node-fetch');
 const { WebSocketServer } = require('ws');
-const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
-console.log('[boot] deepgram createClient type:', typeof createClient);
+const { Deepgram } = require('@deepgram/sdk');
+console.log('[boot] deepgram Deepgram type:', typeof Deepgram);
 
 const DEEPGRAM_API_KEY  = process.env.DEEPGRAM_API_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
@@ -362,9 +362,9 @@ wss.on('connection', (ws, request) => {
   if (url.pathname === '/transcribe') {
     console.log('[transcribe] client connected');
 
-    const deepgramClient = createClient(process.env.DEEPGRAM_API_KEY);
+    const deepgramClient = new Deepgram(process.env.DEEPGRAM_API_KEY);
 
-    const dgLive = deepgramClient.listen.live({
+    const dgLive = deepgramClient.transcription.live({
       model:            'nova-2',
       language:         'multi',
       encoding:         'linear16',
@@ -373,33 +373,31 @@ wss.on('connection', (ws, request) => {
       punctuate:        true,
       smart_format:     true,
       interim_results:  true,
-      utterance_end_ms: 1000,
     });
 
-    dgLive.on(LiveTranscriptionEvents.Open, () => {
+    dgLive.addListener('open', () => {
       console.log('[transcribe] Deepgram connected');
 
-      // Only start forwarding audio once Deepgram is ready
       ws.on('message', (data) => {
-        if (dgLive.getReadyState() === 1) {
-          dgLive.send(data);
-        }
+        dgLive.send(data);
       });
     });
 
-    dgLive.on(LiveTranscriptionEvents.Transcript, (data) => {
+    dgLive.addListener('transcriptReceived', (transcription) => {
+      const data = JSON.parse(transcription);
       const transcript = data.channel?.alternatives?.[0]?.transcript;
       if (!transcript) return;
+
       ws.send(JSON.stringify({
         type:       'transcript',
         text:       transcript,
         is_final:   data.is_final,
         confidence: data.channel?.alternatives?.[0]?.confidence ?? 0,
-        language:   data.channel?.alternatives?.[0]?.languages?.[0] ?? 'multi',
+        language:   'multi',
       }));
     });
 
-    dgLive.on(LiveTranscriptionEvents.Error, (err) => {
+    dgLive.addListener('error', (err) => {
       console.error('[transcribe] DG error:', err);
       ws.send(JSON.stringify({
         type:    'error',
