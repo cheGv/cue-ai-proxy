@@ -1,6 +1,10 @@
 require('dotenv').config({ override: true });
 const express = require('express');
 const fetch = require('node-fetch');
+const { WebSocketServer } = require('ws');
+const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
+
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const PORT = process.env.PORT || 3001;
@@ -205,21 +209,33 @@ Respond with the JSON object only. No other text.`
 });
 app.post('/pre-session-brief', async (req, res) => {
   try {
-    const { model, system, user_message } = req.body;
+    const { model, system, user_message, thinking } = req.body;
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    };
+    // Extended thinking requires the interleaved-thinking beta header
+    if (thinking) {
+      headers['anthropic-beta'] = 'interleaved-thinking-2025-05-14';
+    }
+
+    const bodyObj = {
+      model: model || 'claude-opus-4-5',
+      // When thinking is enabled max_tokens must exceed budget_tokens
+      max_tokens: thinking
+        ? Math.max(4096, (thinking.budget_tokens || 0) + 1024)
+        : 1024,
+      system: system,
+      messages: [{ role: 'user', content: user_message }],
+    };
+    if (thinking) bodyObj.thinking = thinking;
 
     const upstream = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: model || 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        system: system,
-        messages: [{ role: 'user', content: user_message }],
-      }),
+      headers,
+      body: JSON.stringify(bodyObj),
     });
 
     const data = await upstream.json();
@@ -330,6 +346,106 @@ app.post('/extract', async (req, res) => {
 
 const generateGoals = require('./routes/generateGoals');
 app.use('/api', generateGoals);
-app.listen(PORT, () => {
+
+// ── HTTP server (captured for WebSocket upgrade) ────────────────────────────
+const server = app.listen(PORT, () => {
   console.log(`Cue proxy listening on port ${PORT}`);
+});
+
+// ── WebSocket /transcribe — Deepgram live transcription relay ────────────────
+// Flutter connects here, sends raw audio bytes (audio/webm;codecs=opus chunks).
+// We relay to Deepgram and forward transcript events back to Flutter as JSON.
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (url.pathname !== '/transcribe') {
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
+
+wss.on('connection', (clientWs) => {
+  console.log('[transcribe] Flutter client connected');
+
+  if (!DEEPGRAM_API_KEY) {
+    console.error('[transcribe] DEEPGRAM_API_KEY not set — closing');
+    clientWs.send(JSON.stringify({ type: 'error', text: 'Deepgram key not configured on server.' }));
+    clientWs.close();
+    return;
+  }
+
+  const deepgram = createClient(DEEPGRAM_API_KEY);
+
+  // NOTE: Do NOT set encoding/sample_rate — Flutter sends audio/webm;codecs=opus
+  // and Deepgram auto-detects container format. Specifying linear16 here would
+  // cause a codec mismatch and produce garbled transcripts.
+  const dgLive = deepgram.listen.live({
+    model:           'nova-2',
+    language:        'multi',
+    punctuate:       true,
+    smart_format:    true,
+    interim_results: true,
+    utterance_end_ms: 1000,
+    channels:        1,
+  });
+
+  // ── Deepgram → Flutter ────────────────────────────────────────────────────
+  dgLive.on(LiveTranscriptionEvents.Open, () => {
+    console.log('[transcribe] Deepgram connection open');
+    if (clientWs.readyState === clientWs.OPEN) {
+      clientWs.send(JSON.stringify({ type: 'ready' }));
+    }
+  });
+
+  dgLive.on(LiveTranscriptionEvents.Transcript, (data) => {
+    const alt = data?.channel?.alternatives?.[0];
+    if (!alt) return;
+    const text     = alt.transcript ?? '';
+    const isFinal  = data.is_final ?? false;
+    const conf     = alt.confidence ?? null;
+    const lang     = data.channel?.detected_language ?? null;
+
+    if (!text) return;   // skip empty interim results
+
+    if (clientWs.readyState === clientWs.OPEN) {
+      const msg = { type: 'transcript', text, is_final: isFinal };
+      if (conf  !== null) msg.confidence = conf;
+      if (lang  !== null) msg.language   = lang;
+      clientWs.send(JSON.stringify(msg));
+    }
+  });
+
+  dgLive.on(LiveTranscriptionEvents.Error, (err) => {
+    console.error('[transcribe] Deepgram error:', err);
+    if (clientWs.readyState === clientWs.OPEN) {
+      clientWs.send(JSON.stringify({ type: 'error', text: String(err?.message ?? err) }));
+    }
+  });
+
+  dgLive.on(LiveTranscriptionEvents.Close, () => {
+    console.log('[transcribe] Deepgram connection closed');
+    if (clientWs.readyState === clientWs.OPEN) clientWs.close();
+  });
+
+  // ── Flutter → Deepgram ────────────────────────────────────────────────────
+  clientWs.on('message', (data) => {
+    if (dgLive.getReadyState() === 1 /* OPEN */) {
+      dgLive.send(data);
+    }
+  });
+
+  // ── Cleanup when Flutter disconnects ─────────────────────────────────────
+  clientWs.on('close', () => {
+    console.log('[transcribe] Flutter client disconnected — finishing Deepgram');
+    try { dgLive.finish(); } catch (_) {}
+  });
+
+  clientWs.on('error', (err) => {
+    console.error('[transcribe] Flutter WS error:', err);
+    try { dgLive.finish(); } catch (_) {}
+  });
 });
