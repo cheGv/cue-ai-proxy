@@ -373,24 +373,23 @@ wss.on('connection', (clientWs) => {
 
   if (!DEEPGRAM_API_KEY) {
     console.error('[transcribe] DEEPGRAM_API_KEY not set — closing');
-    clientWs.send(JSON.stringify({ type: 'error', text: 'Deepgram key not configured on server.' }));
+    clientWs.send(JSON.stringify({ type: 'error', message:'Deepgram key not configured on server.' }));
     clientWs.close();
     return;
   }
 
   const deepgram = createClient(DEEPGRAM_API_KEY);
 
-  // NOTE: Do NOT set encoding/sample_rate — Flutter sends audio/webm;codecs=opus
-  // and Deepgram auto-detects container format. Specifying linear16 here would
-  // cause a codec mismatch and produce garbled transcripts.
   const dgLive = deepgram.listen.live({
-    model:           'nova-2',
-    language:        'multi',
-    punctuate:       true,
-    smart_format:    true,
-    interim_results: true,
+    model:            'nova-2',
+    language:         'multi',
+    encoding:         'linear16',
+    sample_rate:      16000,
+    channels:         1,
+    punctuate:        true,
+    smart_format:     true,
+    interim_results:  true,
     utterance_end_ms: 1000,
-    channels:        1,
   });
 
   // ── Deepgram → Flutter ────────────────────────────────────────────────────
@@ -422,7 +421,7 @@ wss.on('connection', (clientWs) => {
   dgLive.on(LiveTranscriptionEvents.Error, (err) => {
     console.error('[transcribe] Deepgram error:', err);
     if (clientWs.readyState === clientWs.OPEN) {
-      clientWs.send(JSON.stringify({ type: 'error', text: String(err?.message ?? err) }));
+      clientWs.send(JSON.stringify({ type: 'error', message:String(err?.message ?? err) }));
     }
   });
 
