@@ -365,14 +365,11 @@ wss.on('connection', (ws, request) => {
     const deepgramClient = new Deepgram(process.env.DEEPGRAM_API_KEY);
 
     const dgLive = deepgramClient.transcription.live({
-      model:            'nova-2',
-      language:         'multi',
-      encoding:         'linear16',
-      sample_rate:      16000,
-      channels:         1,
-      punctuate:        true,
-      smart_format:     true,
-      interim_results:  true,
+      model:           'nova-2',
+      language:        'multi',
+      punctuate:       true,
+      smart_format:    true,
+      interim_results: true,
     });
 
     dgLive.addListener('open', () => {
@@ -384,10 +381,12 @@ wss.on('connection', (ws, request) => {
     });
 
     dgLive.addListener('transcriptReceived', (transcription) => {
+      console.log('[transcribe] raw:', transcription.substring(0, 200));
       const data = JSON.parse(transcription);
       const transcript = data.channel?.alternatives?.[0]?.transcript;
       if (!transcript) return;
 
+      console.log('[transcribe] sending:', transcript);
       ws.send(JSON.stringify({
         type:       'transcript',
         text:       transcript,
