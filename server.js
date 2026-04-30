@@ -434,6 +434,84 @@ app.post('/cue-study', async (req, res) => {
   }
 });
 
+// ── /generate-brief — Phase 2 one-sentence companion thought ──────────────────
+// Body: { chart_context: string }
+// Returns: { thought: string, highlight: string }  — the Flutter chart wraps
+// `highlight` in amber inside the rendered `thought`. Keeps prompt + JSON
+// extraction here so the Flutter side stays thin.
+const CUE_BRIEF_SYSTEM_PROMPT = `You are Cue, a clinical companion. Generate ONE sentence (max 35 words) that names the most important clinical observation about this child today, based on their chart. The sentence must:
+- Reference a specific recent observation from the chart
+- Identify a tension, gap, or opportunity worth noticing
+- Use plain language, not clinical jargon
+- End with the implication, not the analysis
+- Be written in Indian clinical English
+
+Output format: a JSON object {"thought": "<the sentence>", "highlight": "<the 2-5 word phrase to highlight in amber>"}.
+
+Example: {"thought": "Ranadir activated three symbols unprompted on Tuesday — but that session is undocumented and tomorrow plan still assumes maximum support.", "highlight": "three symbols unprompted"}
+
+Output the JSON object only. No markdown, no code fences, no commentary.`;
+
+app.post('/generate-brief', async (req, res) => {
+  try {
+    const { chart_context } = req.body || {};
+    if (typeof chart_context !== 'string' || chart_context.trim() === '') {
+      return res.status(400).json({ error: 'chart_context (string) is required' });
+    }
+
+    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model:      'claude-sonnet-4-20250514',
+        max_tokens: 400,
+        system:     CUE_BRIEF_SYSTEM_PROMPT,
+        messages:   [{ role: 'user', content: chart_context }],
+      }),
+    });
+
+    const data = await upstream.json();
+    if (!upstream.ok) {
+      console.error('[/generate-brief] Anthropic error — status:', upstream.status,
+        '| message:', data?.error?.message);
+      return res.status(upstream.status).json({
+        error: data?.error?.message || 'Anthropic API error',
+      });
+    }
+
+    // Extract assistant text and parse JSON, stripping any code-fence wrappers.
+    let raw = (data?.content?.[0]?.text ?? '').trim();
+    if (raw.startsWith('```')) {
+      raw = raw.replace(/^```[a-z]*\n?/, '').replace(/```$/, '').trim();
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      console.error('[/generate-brief] non-JSON model output:', raw);
+      return res.status(502).json({
+        error:   'Brief generator returned non-JSON',
+        thought: raw,           // fall back to plain text so the UI still has something
+        highlight: '',
+      });
+    }
+
+    res.json({
+      thought:   (parsed.thought   ?? '').toString(),
+      highlight: (parsed.highlight ?? '').toString(),
+    });
+  } catch (err) {
+    console.error('[/generate-brief] error — message:', err.message);
+    console.error('[/generate-brief] error — stack:',   err.stack);
+    res.status(500).json({ error: 'Brief generation failed' });
+  }
+});
+
 const generateGoals = require('./routes/generateGoals');
 app.use('/api', generateGoals);
 
