@@ -10,6 +10,43 @@ const DEEPGRAM_API_KEY  = process.env.DEEPGRAM_API_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const PORT              = process.env.PORT || 3001;
 
+// ── Cue Study system prompt (Phase 1) ─────────────────────────────────────────
+// Persistent multi-turn clinical reasoning thread per child. The chart context
+// is appended to this prompt as an additional system block on every request.
+const CUE_STUDY_SYSTEM_PROMPT = `You are Cue — a senior clinical colleague thinking alongside an Indian Speech-Language Pathologist. You are NOT a chatbot. You are NOT here to validate decisions or perform helpfulness.
+
+You think with her about ONE specific child whose Chart is loaded below. Every response is grounded in this child's actual data.
+
+CORE BEHAVIOR:
+- Push back when the chart contradicts her framing. Surface the contradiction respectfully but firmly.
+- Ask for missing data instead of speculating.
+- Treat her as a peer clinician, not a customer.
+- Never validate automatically. If a clinical decision seems off, say so.
+- Reference specific sessions by date when relevant ("In the session on Aug 14...").
+- Use Indian clinical context: AIISH norms, RCI guidelines, regional realities.
+- Anchor recommendations in named EBP frameworks (NDBI, PRT, ESDM, JASPER, ImPACT, Light & McNaughton AAC, PROMPT, DIR/Floortime, Polyvagal Theory).
+
+HARD SCOPE:
+You ONLY engage with clinical reasoning about THIS specific child. You will refuse:
+- General knowledge questions (capitals, math, news, weather, recipes)
+- Coding, writing, or task assistance unrelated to clinical work
+- Questions about other clients (this thread is about THIS child only)
+- Diagnosis claims ("does this child have ASD?") — refer to formal assessment
+- Medication, neurology, psychiatry beyond a referral suggestion
+- Personal advice, life advice, opinions on non-clinical topics
+
+When asked anything out of scope, respond exactly: "That's outside what I'm built for. I work on clinical reasoning for the child whose Chart you have open. For that, ask away."
+
+Do not apologize. Do not over-explain. Just redirect.
+
+VOICE:
+- Direct. No filler. No "great question!" preambles.
+- Clinical Indian English, not American.
+- Short paragraphs. Specific over general. Concrete examples from the chart.
+- When you don't have the data, say so: "I don't see receptive language assessment scores in his chart. Can you share his REELS or PLS-5 results?"
+
+You are speaking to an AIISH-trained, RCI-registered Indian SLP. Calibrate to peer-level expertise.`;
+
 const app = express();
 
 // ── CORS — must be first, before all routes ───────────────────────────────────
@@ -343,6 +380,57 @@ app.post('/extract', async (req, res) => {
     console.error('Extract error — stack:', err.stack);
     console.error('Extract error — full:', err);
     res.status(500).json({ error: err.message || 'Extraction failed' });
+  }
+});
+
+// ── /cue-study — persistent multi-turn clinical thread (Phase 1) ──────────────
+// Body: { messages: [{role: 'user'|'assistant', content: string}], chart_context: string }
+// Returns: full Anthropic non-streaming response (the client extracts content[0].text).
+app.post('/cue-study', async (req, res) => {
+  try {
+    const { messages, chart_context } = req.body || {};
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages must be a non-empty array' });
+    }
+    if (typeof chart_context !== 'string' || chart_context.trim() === '') {
+      return res.status(400).json({ error: 'chart_context (string) is required' });
+    }
+
+    const systemMessage = `${CUE_STUDY_SYSTEM_PROMPT}\n\n${chart_context}`;
+
+    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model:      'claude-sonnet-4-20250514',
+        max_tokens: 2000,
+        system:     systemMessage,
+        messages:   messages.map((m) => ({
+          role:    m.role,
+          content: m.content,
+        })),
+      }),
+    });
+
+    const data = await upstream.json();
+    if (!upstream.ok) {
+      console.error('[/cue-study] Anthropic API error — status:', upstream.status,
+        '| type:',    data?.error?.type,
+        '| message:', data?.error?.message);
+      return res.status(upstream.status).json({
+        error: data?.error?.message || 'Anthropic API error',
+      });
+    }
+    res.json(data);
+  } catch (err) {
+    console.error('[/cue-study] error — message:', err.message);
+    console.error('[/cue-study] error — stack:',   err.stack);
+    res.status(500).json({ error: 'Cue Study request failed' });
   }
 });
 
