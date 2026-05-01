@@ -50,7 +50,30 @@ OUTPUT FIELD CONTRACT for goals:
   short_term_goals[].specific      → Part A for the step.
   short_term_goals[].conditions_text → Part B for the step (empty string when the step is under ~25 words).
 
-INSUFFICIENT DATA PROTOCOL: If fewer than 3 clinical sessions AND no formal assessment, set router_confidence to "low", framework_router to "generic_fallback", populate data_gaps, produce maximum 1 LTG.
+CLINICAL COHERENCE RULES — see CLAUDE.md §13.3. Every goal MUST satisfy all three. A violation is a critical failure that surfaces as a Cue-Study contradiction in front of the SLP and is catastrophic for trust.
+
+  INTERNAL COHERENCE RULE — a goal cannot simultaneously claim independence AND specify scaffolding. The dependent variable must match the measurement environment.
+    - If scaffolding is provided in the measurement environment, the criterion is "accuracy with [specified scaffolding]" or "support fading rate" or "partial independence with cue level X" — never bare "independence."
+    - If true independence is the criterion, no scaffolding clause appears anywhere in the goal.
+
+    FORBIDDEN: "…80% independence across 3 consecutive sessions, given consistent co-regulation scaffolding from a familiar adult." (Independence + scaffolding contradiction.)
+    CORRECT (variant 1): "…80% accuracy when co-regulation scaffolding is provided by a familiar adult, across 3 consecutive sessions."
+    CORRECT (variant 2): "…80% independence across 3 consecutive sessions, with co-regulation scaffolding faded across the criterion window."
+
+  PREREQUISITE-BEFORE-COMMITMENT RULE — if a goal depends on an assessment that has NOT been completed in the chart's session history, do NOT bury the assessment as a TBD inside the goal text. Stage in two LTGs:
+    - Phase 1 LTG: complete the prerequisite assessment.
+    - Phase 2 LTG: the specific intervention, with parameters set after Phase 1 lands in the chart.
+    The "TBD inside committed goal" pattern is a signal the goal hasn't earned its specifics yet. Do not produce it.
+
+    FORBIDDEN: "…the child will use a clinician-selected AAC system (symbol level and access method to be determined following feature matching assessment)…" (TBD inside committed goal.)
+    CORRECT (Phase 1 LTG): "Complete an AAC feature matching assessment to determine the child's symbol level and access method, within 4 weeks." (Phase 2 is generated only after Phase 1 results are recorded in the chart.)
+
+  TIMELINE CALIBRATION RULE — when the chart has zero sessions or no baseline data on the relevant skill, timelines are stated as conditional ranges, NOT fixed durations. A 12-week timeline asserted on day zero is a guess; speak that uncertainty into the goal.
+
+    FORBIDDEN: "Within 12 weeks, the child will…" (no baseline in chart, fixed timeline.)
+    CORRECT: "Following baseline assessment, target review at 12 weeks." OR: "Post-baseline assessment, expected 8–12 weeks to criterion."
+
+INSUFFICIENT DATA PROTOCOL: If fewer than 3 clinical sessions AND no formal assessment, set router_confidence to "low", framework_router to "generic_fallback", populate data_gaps, produce maximum 1 LTG. In this case the LTG SHOULD be a Phase 1 assessment-completion goal under the prerequisite-before-commitment rule above.
 
 OUTPUT: Return ONLY valid JSON — no preamble, no markdown fences, no text outside the JSON object.
 
