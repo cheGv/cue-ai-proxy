@@ -25,6 +25,31 @@ NEURODIVERSITY-AFFIRMING CONSTRAINTS — hard rules, any violation is a critical
 NEVER include: "reduce stimming", "increase eye contact", "decrease non-compliance", "reduce echolalic language", "normalise", "respond correctly", "appropriate behaviour".
 ALWAYS frame goals as expansion of repertoire, adding modality not replacing, increasing access not reducing expression.
 
+LANGUAGE DISCIPLINE — see CLAUDE.md §13. Cue presumes competence; goals describe what the child WILL DO, not what is missing or wrong. FORBIDDEN words and phrases when describing children, goals, or families: stuck, overdue, behind, no progress, plateau, struggling, failing, regressing, slow learner, low-functioning, non-progressing, falling behind, lagging, despite, intervention timing, developmental trajectory, critical window, critical period, missed opportunity, falling further, gap widening, behind peers, age-appropriate, age-typical. The phrase "developmental delay" is forbidden as a Cue-authored verdict; quoting the diagnosis field verbatim is fine.
+
+GOAL STATEMENT STRUCTURE — see CLAUDE.md §13.3 — non-negotiable. Every long-term goal renders in two parts:
+
+  PART A — Goal statement: a single parseable sentence, 25–35 words, leading with the clinical action and ending with the measurement frame. Format:
+    "[Subject] will [action] [conditions] [criterion] [time/sessions frame]."
+
+  Correct example (action-first, scannable):
+    "The child will request objects, activities, or regulatory breaks using a clinician-selected AAC system across two communicative partners, at 80% independence over 3 consecutive sessions, within 12 weeks."
+
+  FORBIDDEN example (84 words, leads with timing, buries the action inside nested clauses):
+    "Within 12 weeks, during structured therapy sessions and at least one generalisation context (home or classroom), the child will use a clinician-selected AAC system (symbol level and access method to be determined following feature matching assessment) to independently communicate a request for an object, activity, or regulatory break across a minimum of 2 communicative partners, with 80% independence across 3 consecutive data collection sessions, given consistent co-regulation scaffolding from a familiar adult."
+
+  PART B — Conditions block: a separate paragraph following the goal statement, plain sentences (NOT parenthetical clauses inside the goal statement). Lists setting requirements, scaffolding dependencies, and TBD assessment notes.
+    Example:
+      "Conditions: structured therapy + at least one generalisation context (home/classroom). AAC symbol level and access method TBD via feature matching assessment. Co-regulation scaffolding from a familiar adult is provided throughout."
+
+Apply the same Part A / Part B structure to short-term steps where they are substantial enough to need it. Short-term steps under ~25 words: render as a single sentence with no conditions block.
+
+OUTPUT FIELD CONTRACT for goals:
+  goal_text          → Part A only. 25–35 words. Action-first, ends with criterion + time frame. No nested parentheticals, no leading "Within N weeks…". MUST be a single sentence.
+  conditions_text    → Part B only. The conditions paragraph. Empty string if no conditions are needed.
+  short_term_goals[].specific      → Part A for the step.
+  short_term_goals[].conditions_text → Part B for the step (empty string when the step is under ~25 words).
+
 INSUFFICIENT DATA PROTOCOL: If fewer than 3 clinical sessions AND no formal assessment, set router_confidence to "low", framework_router to "generic_fallback", populate data_gaps, produce maximum 1 LTG.
 
 OUTPUT: Return ONLY valid JSON — no preamble, no markdown fences, no text outside the JSON object.
@@ -41,16 +66,17 @@ OUTPUT: Return ONLY valid JSON — no preamble, no markdown fences, no text outs
       "category": "regulatory_communicative | language_development | aac_modality | motor_speech | pragmatics",
       "domain": "short clinical domain label",
       "title": "one sentence active voice what child WILL DO",
-      "goal_text": "full SMART LTG with criterion, generalisation context, time frame beginning with Within N weeks",
+      "goal_text": "PART A only — 25-35 words, action-first, ends with criterion + time frame. No leading 'Within N weeks…'.",
+      "conditions_text": "PART B — conditions paragraph (settings, scaffolding, TBD notes). Empty string if not needed.",
       "time_frame_weeks": 12,
       "evidence_rationale": "2-3 sentences citing specific sessions or assessments",
       "evidence_tags": [
         {"framework_name": "framework name", "rationale": "one sentence why this applies"}
       ],
       "short_term_goals": [
-        {"sequence_num": 1, "specific": "what will be observed", "measurable": "criterion", "target_accuracy": 80, "time_bound_sessions": 8},
-        {"sequence_num": 2, "specific": "...", "measurable": "...", "target_accuracy": 80, "time_bound_sessions": 10},
-        {"sequence_num": 3, "specific": "...", "measurable": "...", "target_accuracy": 80, "time_bound_sessions": 12}
+        {"sequence_num": 1, "specific": "Part A for the step", "conditions_text": "Part B (empty string if short)", "measurable": "criterion", "target_accuracy": 80, "time_bound_sessions": 8},
+        {"sequence_num": 2, "specific": "...", "conditions_text": "...", "measurable": "...", "target_accuracy": 80, "time_bound_sessions": 10},
+        {"sequence_num": 3, "specific": "...", "conditions_text": "...", "measurable": "...", "target_accuracy": 80, "time_bound_sessions": 12}
       ]
     }
   ]
@@ -194,7 +220,14 @@ router.post('/generate-goals', async (req, res) => {
           category: goal.category,
           domain: goal.domain,
           goal_text: goal.goal_text,
-          notes: goal.title,
+          // Phase 3.3: conditions paragraph stored alongside the goal
+          // statement. Persisted into `notes` (existing column on
+          // long_term_goals) prefixed with the previous title so neither
+          // signal is lost. The chart screen can split on the prefix
+          // when it eventually renders Part B as its own paragraph.
+          notes: (goal.conditions_text != null && goal.conditions_text.trim() !== '')
+              ? `${goal.title}\n\nConditions: ${goal.conditions_text}`
+              : goal.title,
           time_frame_weeks: goal.time_frame_weeks ?? 12,
           is_ai_generated: true,
           original_text: goal.goal_text,
@@ -207,19 +240,28 @@ router.post('/generate-goals', async (req, res) => {
 
       if (ltgErr) throw new Error(`long_term_goals insert failed: ${ltgErr.message}`);
 
-      const stoRows = (goal.short_term_goals ?? []).map(sto => ({
-        long_term_goal_id: ltgRow.id,
-        client_id: String(client_id),
-        user_id: user.id,
-        sequence_num: sto.sequence_num,
-        specific: sto.specific,
-        measurable: sto.measurable,
-        target_accuracy: sto.target_accuracy ?? 80,
-        time_bound_sessions: sto.time_bound_sessions ?? 12,
-        is_ai_generated: true,
-        original_text: sto.specific,
-        status: 'active'
-      }));
+      const stoRows = (goal.short_term_goals ?? []).map(sto => {
+        // Phase 3.3 — STO conditions get appended to the original_text
+        // field so they round-trip without a schema migration. The
+        // primary `specific` field carries Part A only.
+        const conditions = (sto.conditions_text ?? '').trim();
+        const original = conditions
+          ? `${sto.specific}\n\nConditions: ${conditions}`
+          : sto.specific;
+        return {
+          long_term_goal_id: ltgRow.id,
+          client_id: String(client_id),
+          user_id: user.id,
+          sequence_num: sto.sequence_num,
+          specific: sto.specific,
+          measurable: sto.measurable,
+          target_accuracy: sto.target_accuracy ?? 80,
+          time_bound_sessions: sto.time_bound_sessions ?? 12,
+          is_ai_generated: true,
+          original_text: original,
+          status: 'active'
+        };
+      });
 
       if (stoRows.length) {
         const { error: stoErr } = await db.from('short_term_goals').insert(stoRows);
