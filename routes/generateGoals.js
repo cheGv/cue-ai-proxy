@@ -168,6 +168,44 @@ FORBIDDEN (workload prescription — verbatim shape from the production bug):
 
 The forbidden version is a contract for academic-grade comprehensiveness on a tight timeline. The correct version is a starting frame the SLP shapes.
 
+SENTENCE-LENGTH AND STRUCTURE DISCIPLINE.
+
+Cue's plan output is documentation the SLP reads in 30-second windows between sessions. Density kills scannability. Every sentence in goal_text, conditions_text, and short_term_goals[].specific follows these rules:
+
+1. Each sentence caps at 22 words.
+2. Compound sentences joined by semicolons are forbidden when the same content can split into two short sentences.
+3. Nested parenthetical clauses inside the main clause are forbidden when the same content can move to a follow-on sentence.
+4. The first sentence of every goal_text states the clinical action plainly. Modifiers, conditions, and timelines move to follow-on sentences.
+
+CORRECT (short, scannable):
+"Establish a baseline speech sound profile sufficient to ground next-phase intervention goals. The profile characterises error pattern, stimulability, and functional intelligibility impact."
+
+FORBIDDEN (compound, dense):
+"Establish a baseline speech sound profile characterising error pattern, stimulability, and functional intelligibility impact, sufficient to ground Phase 2 intervention goals."
+
+The forbidden version compresses two ideas into one 22+ word sentence. The correct version separates them.
+
+STRUCTURED CONDITIONS OUTPUT — see CLAUDE.md §13.13.
+
+The conditions_text field on each LTG (and on each short_term_goals[] entry where present) is NO LONGER a single string. It is an object with three fields:
+
+{
+  "queued_activities": [
+    "Activity 1 short description.",
+    "Activity 2 short description.",
+    "Activity 3 short description."
+  ],
+  "suitable_instruments": "Suitable instruments include — selection at clinician's discretion based on clinic toolkit: [option 1]; [option 2]; [option 3]; or observational rating scale / clinician's preferred alternative.",
+  "discretion_close": "Final scope and pacing are at the clinician's discretion based on session length, parent availability, and clinical priorities."
+}
+
+Field roles:
+- queued_activities: array of 2-4 short activity descriptions. Each activity is one sentence, max 22 words. No instrument names — those go in suitable_instruments.
+- suitable_instruments: a single string in the menu pattern from §13.9. The locked prefix "Suitable instruments include — selection at clinician's discretion based on clinic toolkit:" and the trailing fallback "or observational rating scale / clinician's preferred alternative." stay verbatim. Mid-content lists 2-4 instruments separated by semicolons.
+- discretion_close: the locked closing line above. Always present, always identical wording.
+
+If a goal genuinely has no conditions to surface (rare), emit conditions_text as an empty string "". Otherwise, always emit the three-field object.
+
 OUTPUT: Return ONLY valid JSON — no preamble, no markdown fences, no text outside the JSON object.
 
 {
@@ -182,17 +220,21 @@ OUTPUT: Return ONLY valid JSON — no preamble, no markdown fences, no text outs
       "category": "regulatory_communicative | language_development | aac_modality | motor_speech | pragmatics",
       "domain": "short clinical domain label",
       "title": "one sentence active voice what child WILL DO",
-      "goal_text": "PART A only — 25-35 words, action-first, ends with criterion + time frame. No leading 'Within N weeks…'.",
-      "conditions_text": "PART B — conditions paragraph (settings, scaffolding, TBD notes). Empty string if not needed.",
+      "goal_text": "PART A only — short sentences, ≤22 words each, action-first first sentence, follow-on sentences carry modifiers/conditions/timeline. No leading 'Within N weeks…'.",
+      "conditions_text": {
+        "queued_activities": ["Activity 1 short description.", "Activity 2 short description.", "Activity 3 short description."],
+        "suitable_instruments": "Suitable instruments include — selection at clinician's discretion based on clinic toolkit: [option 1]; [option 2]; [option 3]; or observational rating scale / clinician's preferred alternative.",
+        "discretion_close": "Final scope and pacing are at the clinician's discretion based on session length, parent availability, and clinical priorities."
+      },
       "time_frame_weeks": 12,
       "evidence_rationale": "2-3 sentences citing specific sessions or assessments",
       "evidence_tags": [
         {"framework_name": "framework name", "rationale": "one sentence why this applies"}
       ],
       "short_term_goals": [
-        {"sequence_num": 1, "specific": "Part A for the step", "conditions_text": "Part B (empty string if short)", "measurable": "criterion", "target_accuracy": 80, "time_bound_sessions": 8},
-        {"sequence_num": 2, "specific": "...", "conditions_text": "...", "measurable": "...", "target_accuracy": 80, "time_bound_sessions": 10},
-        {"sequence_num": 3, "specific": "...", "conditions_text": "...", "measurable": "...", "target_accuracy": 80, "time_bound_sessions": 12}
+        {"sequence_num": 1, "specific": "Part A for the step — short sentences, ≤22 words each", "conditions_text": {"queued_activities": ["..."], "suitable_instruments": "Suitable instruments include — selection at clinician's discretion based on clinic toolkit: [option]; or observational rating scale / clinician's preferred alternative.", "discretion_close": "Final scope and pacing are at the clinician's discretion based on session length, parent availability, and clinical priorities."}, "measurable": "criterion", "target_accuracy": 80, "time_bound_sessions": 8},
+        {"sequence_num": 2, "specific": "...", "conditions_text": {"queued_activities": ["..."], "suitable_instruments": "...", "discretion_close": "Final scope and pacing are at the clinician's discretion based on session length, parent availability, and clinical priorities."}, "measurable": "...", "target_accuracy": 80, "time_bound_sessions": 10},
+        {"sequence_num": 3, "specific": "...", "conditions_text": {"queued_activities": ["..."], "suitable_instruments": "...", "discretion_close": "Final scope and pacing are at the clinician's discretion based on session length, parent availability, and clinical priorities."}, "measurable": "...", "target_accuracy": 80, "time_bound_sessions": 12}
       ]
     }
   ]
@@ -336,14 +378,15 @@ router.post('/generate-goals', async (req, res) => {
           category: goal.category,
           domain: goal.domain,
           goal_text: goal.goal_text,
-          // Phase 3.3: conditions paragraph stored alongside the goal
-          // statement. Persisted into `notes` (existing column on
-          // long_term_goals) prefixed with the previous title so neither
-          // signal is lost. The chart screen can split on the prefix
-          // when it eventually renders Part B as its own paragraph.
-          notes: (goal.conditions_text != null && goal.conditions_text.trim() !== '')
-              ? `${goal.title}\n\nConditions: ${goal.conditions_text}`
-              : goal.title,
+          notes: (() => {
+            const c = goal.conditions_text;
+            const serialized = (c && typeof c === 'object')
+              ? JSON.stringify(c)
+              : (typeof c === 'string' ? c.trim() : '');
+            return serialized
+              ? `${goal.title}\n\nConditions: ${serialized}`
+              : goal.title;
+          })(),
           time_frame_weeks: goal.time_frame_weeks ?? 12,
           is_ai_generated: true,
           original_text: goal.goal_text,
@@ -357,10 +400,10 @@ router.post('/generate-goals', async (req, res) => {
       if (ltgErr) throw new Error(`long_term_goals insert failed: ${ltgErr.message}`);
 
       const stoRows = (goal.short_term_goals ?? []).map(sto => {
-        // Phase 3.3 — STO conditions get appended to the original_text
-        // field so they round-trip without a schema migration. The
-        // primary `specific` field carries Part A only.
-        const conditions = (sto.conditions_text ?? '').trim();
+        const c = sto.conditions_text;
+        const conditions = (c && typeof c === 'object')
+          ? JSON.stringify(c)
+          : (typeof c === 'string' ? c.trim() : '');
         const original = conditions
           ? `${sto.specific}\n\nConditions: ${conditions}`
           : sto.specific;
