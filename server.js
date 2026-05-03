@@ -674,24 +674,36 @@ wss.on('connection', (ws, request) => {
     }
     console.log(`[transcribe] received ${keywordList.length} keywords for session`);
 
+    // 4.0.7.9g: per-SLP language mode. Defaults to 'multi'
+    // (code-switching) if absent, but typical Indian-English
+    // SLPs set 'en-IN' to lock all output to Latin script.
+    const ALLOWED_LANGUAGES = new Set([
+      'multi', 'en', 'en-IN',
+      'te', 'hi', 'kn', 'ta', 'ml', 'bn', 'mr', 'gu', 'pa', 'ur'
+    ]);
+    const languageParam = url.searchParams.get('language_mode');
+    const language = (languageParam && ALLOWED_LANGUAGES.has(languageParam))
+      ? languageParam
+      : 'multi';
+    console.log(`[transcribe] language_mode=${language} (param=${languageParam})`);
+
     const deepgramClient = new Deepgram(process.env.DEEPGRAM_API_KEY);
 
     const dgLive = deepgramClient.transcription.live({
       model:           'nova-3',
-      // 4.0.7.9f: language 'multi' restored. Indian-English
-      // clinical narration is structurally code-switched. nova-3
-      // multilingual handles this natively. Keywords are now
-      // passed dynamically per session from the client based on
-      // client name, current goal vocabulary, SLP specializations,
-      // and a static SLP-universal baseline (kinship terms,
-      // clinical terminology, methodologies).
-      language:        'multi',
+      // 4.0.7.9g: language is now per-SLP, sourced from
+      // slp_profiles.transcription_language_mode and passed by
+      // the client via query string. Default 'multi' for code-
+      // switching; 'en-IN' for Indian-English-only with Latin
+      // script enforcement; specific Indic codes for monolingual
+      // SLPs.
+      language:        language,
       ...(keywordList.length > 0 ? { keywords: keywordList } : {}),
       punctuate:       true,
       smart_format:    true,
       interim_results: true,
     });
-    console.log(`[transcribe] dgLive ready, language=multi, keywords=${keywordList.length}`);
+    console.log(`[transcribe] dgLive ready, language=${language}, keywords=${keywordList.length}`);
 
     dgLive.addListener('open', () => {
       console.log('[transcribe] Deepgram connected');
