@@ -650,7 +650,11 @@ wss.on('connection', (ws, request) => {
 
     const dgLive = deepgramClient.transcription.live({
       model:           'nova-3',
-      language:        'multi',
+      // 4.0.7.9a-fix3: English-only transcription. Loanwords
+      // and code-switched proper names get romanized rather
+      // than rendered in native script. Polyglot support is
+      // a deliberate Phase 2 decision, not a current feature.
+      language:        'en',
       punctuate:       true,
       smart_format:    true,
       interim_results: true,
