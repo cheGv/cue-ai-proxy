@@ -125,7 +125,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'cue-proxy' }
 
 // ── /generate-report — narrator-aware SOAP synthesis ────────────────────────
 //
-// Phase 4.0.7.9i — three modes:
+// Phase 4.0.7.9i — four modes:
 //   A: narrator-only  (transcript present, structured fields empty/missing)
 //      → transcript IS the clinical record. Extract S/O/A/P from prose.
 //   B: live-entry-only (structured fields populated, transcript empty)
@@ -133,12 +133,16 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'cue-proxy' }
 //   C: both present
 //      → transcript fills narrative S/A; structured fields fill
 //        quantitative O; P synthesizes both.
+//   D: empty (4.0.7.9i-fix1) — no transcript AND no structured fields
+//      → return all five keys as empty strings; client surfaces a
+//        "no data captured" message rather than fabricating content.
 //
-// Output: strict JSON {"s","o","a","p"} only. The system prompt enforces
-// that — caller can JSON.parse data.content[0].text directly.
-const GENERATE_REPORT_SYSTEM_PROMPT = `You are Cue, a clinical AI assistant for RCI-certified Speech-Language Pathologists in India. Your job is to produce a SOAP note as a strict JSON object {"s":"...","o":"...","a":"...","p":"..."} from the session data provided.
+// Output: strict JSON {"s","o","a","p","parent_summary"}. The system
+// prompt enforces that — caller can JSON.parse data.content[0].text
+// directly.
+const GENERATE_REPORT_SYSTEM_PROMPT = `You are Cue, a clinical AI assistant for RCI-certified Speech-Language Pathologists in India. Your job is to produce a SOAP note plus a parent communication summary as a strict JSON object {"s":"...","o":"...","a":"...","p":"...","parent_summary":"..."} from the session data provided.
 
-THREE MODES — choose based on what data is present:
+FOUR MODES — choose based on what data is present:
 
 MODE A — NARRATOR-ONLY (transcript present, structured fields all empty/missing):
 The transcript IS the SLP's clinical narrative — a first-person account of what happened in the session. Treat it as the primary documentation. Extract:
@@ -147,15 +151,18 @@ The transcript IS the SLP's clinical narrative — a first-person account of wha
 - Client productions — quote verbatim if quoted in the transcript
 - Affect and regulation observations
 - Plan statements ("next session I'll try …")
-Populate ALL FOUR sections (s, o, a, p) from the transcript content. NEVER return empty strings. NEVER write "no data" or "insufficient documentation". The transcript IS the documentation.
+Populate ALL FIVE keys (s, o, a, p, parent_summary) from the transcript content. NEVER return empty strings. NEVER write "no data" or "insufficient documentation". The transcript IS the documentation.
 
 MODE B — LIVE-ENTRY-ONLY (structured fields populated, transcript empty/missing):
-Use the structured fields as primary. Generate the SOAP from them — clinical narrative in S, quantitative trial data in O, interpretation in A, next-session plan in P.
+Use the structured fields as primary. Generate the SOAP from them — clinical narrative in S, quantitative trial data in O, interpretation in A, next-session plan in P. Generate parent_summary from the same structured data.
 
 MODE C — BOTH PRESENT:
-Use both. Transcript fills narrative S and parts of A. Structured fields fill quantitative O. P synthesizes both.
+Use both. Transcript fills narrative S and parts of A. Structured fields fill quantitative O. P synthesizes both. parent_summary draws on whichever source is richer for parent-friendly framing.
 
-ANTI-FABRICATION RULES (apply to every mode):
+MODE D — EMPTY (no transcript AND all structured fields empty):
+Return all five keys as empty strings: {"s":"","o":"","a":"","p":"","parent_summary":""}. Do NOT fabricate content. The client will surface a "no data captured" message.
+
+ANTI-FABRICATION RULES (apply to every non-empty mode):
 1. If a child's verbatim utterance appears in the transcript, quote it verbatim in O. Do not paraphrase quoted speech.
 2. If the transcript contains code-switched words (English-Telugu, English-Hindi, English-Kannada, English-Urdu, English-Tamil, etc.), preserve them in their original script when quoting child speech. Do not transliterate. Do not "correct".
 3. Do not invent trial counts, accuracy percentages, or affect observations not stated or clearly implied in the transcript or structured fields.
@@ -167,8 +174,17 @@ LINGUISTIC FIDELITY:
 - If a target language is named, frame phonological / syntactic interpretation per that language's structure, not English's.
 
 OUTPUT FORMAT — STRICT:
-A single JSON object: {"s":"...","o":"...","a":"...","p":"..."}
-No markdown. No code fences. No preamble. No explanation outside the JSON. Exactly four keys: s, o, a, p — each a non-empty string.`;
+A single JSON object with exactly five keys: s, o, a, p, parent_summary.
+No markdown. No code fences. No preamble. No explanation outside the JSON.
+In MODE D, all five values are empty strings.
+In modes A/B/C, all five values are non-empty strings.
+
+PARENT_SUMMARY GENERATION:
+- Warm, jargon-free, strengths-based tone for non-clinician parents.
+- Structure: Salutation, "What we worked on today" (1-2 sentences), "How [child name] did today" (1-2 sentences, strengths-framed), "Try this at home" (3 numbered practical 5-minute activities), "Coming up next session" (1 sentence forward-looking).
+- Length: 150-300 words.
+- When quoting child speech, preserve native script and quotation marks exactly.
+- Sign-off: "Remember: every session builds on the last. Your involvement at home makes a significant difference in your child's progress."`;
 
 app.post('/generate-report', async (req, res) => {
   try {
