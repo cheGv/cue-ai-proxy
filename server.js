@@ -650,7 +650,7 @@ wss.on('connection', (ws, request) => {
 
     const dgLive = deepgramClient.transcription.live({
       model:           'nova-2',
-      detect_language: true,
+      language:        'multi',
       punctuate:       true,
       smart_format:    true,
       interim_results: true,
