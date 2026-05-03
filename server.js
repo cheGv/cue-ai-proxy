@@ -649,7 +649,7 @@ wss.on('connection', (ws, request) => {
     const deepgramClient = new Deepgram(process.env.DEEPGRAM_API_KEY);
 
     const dgLive = deepgramClient.transcription.live({
-      model:           'nova-2',
+      model:           'nova-3',
       language:        'multi',
       punctuate:       true,
       smart_format:    true,
