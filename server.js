@@ -646,19 +646,52 @@ wss.on('connection', (ws, request) => {
   if (url.pathname === '/transcribe') {
     console.log('[transcribe] client connected');
 
+    // 4.0.7.9f-part1: per-session keyword boosting. The client
+    // serializes its keyword set as JSON in the `keywords` query
+    // parameter; we parse, sanitize, clamp the weight to Deepgram's
+    // accepted range, format as "term:weight", and cap at 200 entries.
+    const keywordsParam = url.searchParams.get('keywords');
+    let keywordList = [];
+    if (keywordsParam) {
+      try {
+        const decoded = JSON.parse(decodeURIComponent(keywordsParam));
+        keywordList = decoded
+          .filter(kw => kw && kw.term && typeof kw.term === 'string')
+          .map(kw => {
+            const cleanTerm = kw.term
+              .replace(/[():,;]/g, '')
+              .replace(/\s+/g, ' ')
+              .trim();
+            const weight = Math.max(0.5, Math.min(2, Number(kw.weight) || 1.5));
+            return cleanTerm ? `${cleanTerm}:${weight.toFixed(1)}` : null;
+          })
+          .filter(Boolean)
+          .slice(0, 200);
+      } catch (e) {
+        console.error('[transcribe] failed to parse keywords:', e.message);
+        keywordList = [];
+      }
+    }
+    console.log(`[transcribe] received ${keywordList.length} keywords for session`);
+
     const deepgramClient = new Deepgram(process.env.DEEPGRAM_API_KEY);
 
     const dgLive = deepgramClient.transcription.live({
       model:           'nova-3',
-      // 4.0.7.9a-fix3: English-only transcription. Loanwords
-      // and code-switched proper names get romanized rather
-      // than rendered in native script. Polyglot support is
-      // a deliberate Phase 2 decision, not a current feature.
-      language:        'en',
+      // 4.0.7.9f: language 'multi' restored. Indian-English
+      // clinical narration is structurally code-switched. nova-3
+      // multilingual handles this natively. Keywords are now
+      // passed dynamically per session from the client based on
+      // client name, current goal vocabulary, SLP specializations,
+      // and a static SLP-universal baseline (kinship terms,
+      // clinical terminology, methodologies).
+      language:        'multi',
+      ...(keywordList.length > 0 ? { keywords: keywordList } : {}),
       punctuate:       true,
       smart_format:    true,
       interim_results: true,
     });
+    console.log(`[transcribe] dgLive ready, language=multi, keywords=${keywordList.length}`);
 
     dgLive.addListener('open', () => {
       console.log('[transcribe] Deepgram connected');
