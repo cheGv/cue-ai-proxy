@@ -240,7 +240,9 @@ OUTPUT: Return ONLY valid JSON — no preamble, no markdown fences, no text outs
   ]
 }
 
-Rules: 2-3 LTGs, exactly 3 STOs each, STOs sequence scaffold to criterion to generalisation.`;
+Rules: 2-3 LTGs, exactly 3 STOs each, STOs sequence scaffold to criterion to generalisation.
+
+DOMAIN GROUNDING (Phase 4.0.7.23a) — when the chart payload includes a non-empty client.clinical_area and a non-empty framework_grounding array, anchor goal selection in those frameworks. The framework_grounding entries are domain-scoped from Cue's seeded framework library; treat them as the primary evidence base for both LTG direction and STO sequencing. Reference at least one framework_grounding entry by short_code in the evidence_rationale of every LTG when the array is non-empty. The autism-cascade above remains the default lens when clinical_area is autism-developmental or aac; for other areas (fluency, voice, dysphagia, adult-language-cognitive, adult-motor-speech, social-pragmatic, hearing-aural-rehab, literacy, multilingual, speech-sound-disorders, pediatric-language, pediatric-motor-speech), let the framework_grounding entries shape the cascade rather than forcing the autism-specific regulatory-then-AAC framing.`;
 
 router.post('/generate-goals', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -258,15 +260,23 @@ router.post('/generate-goals', async (req, res) => {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 
-  const { client_id, clarifying_answers } = req.body;
-  if (!client_id || !clarifying_answers) {
-    return res.status(400).json({ error: 'client_id and clarifying_answers are required' });
+  const { client_id, clarifying_answers, clinical_area, clinical_area_label } = req.body;
+  // Phase 4.0.7.23a — relaxed validation: client_id is mandatory, but
+  // either clarifying_answers (legacy four-lens) or clinical_area
+  // (14-domain dropdown shipped in cue-flutter 4.0.7.23) is now
+  // sufficient. New clients arrive with clinical_area; legacy
+  // pre-pivot calls still bring clarifying_answers.
+  if (!client_id) {
+    return res.status(400).json({ error: 'client_id is required' });
+  }
+  if (!clarifying_answers && !clinical_area) {
+    return res.status(400).json({ error: 'clinical_area (or legacy clarifying_answers) is required' });
   }
 
   const db = createClient(SUPABASE_URL, SUPABASE_SERVICE);
 
   try {
-    const [clientRes, sessionsRes, goalsRes] = await Promise.all([
+    const [clientRes, sessionsRes, goalsRes, frameworksRes] = await Promise.all([
       db.from('clients').select('*').eq('id', client_id).single(),
       db.from('clinical_sessions')
         .select('id, session_date, soap_note, session_summary, goals_addressed')
@@ -276,7 +286,17 @@ router.post('/generate-goals', async (req, res) => {
       db.from('goals')
         .select('goal_text, domain, status')
         .eq('client_id', client_id)
-        .eq('status', 'active')
+        .eq('status', 'active'),
+      // Phase 4.0.7.23a — domain-scoped framework grounding. When
+      // clinical_area is present, pull every framework whose `domains`
+      // array contains it. Falls back to an empty list (no extra
+      // grounding) when clinical_area is absent — preserves the
+      // legacy clarifying_answers-only path.
+      clinical_area
+        ? db.from('frameworks')
+            .select('short_code, name, description, key_authors, evidence_level, when_to_use')
+            .contains('domains', [clinical_area])
+        : Promise.resolve({ data: [], error: null })
     ]);
 
     if (clientRes.error) throw new Error(`Client fetch failed: ${clientRes.error.message}`);
@@ -284,6 +304,11 @@ router.post('/generate-goals', async (req, res) => {
     const client = clientRes.data;
     const sessions = sessionsRes.data || [];
     const existingGoals = goalsRes.data || [];
+    const frameworks = frameworksRes.data || [];
+    if (clinical_area) {
+      console.log(`[generate-goals] clinical_area=${clinical_area}, ` +
+                  `frameworks=${frameworks.length}`);
+    }
 
     let ageYears = null, ageMonths = null;
     if (client.date_of_birth) {
@@ -304,16 +329,26 @@ router.post('/generate-goals', async (req, res) => {
         diagnosis: client.diagnosis ?? null,
         languages: client.languages?.length ? client.languages : client.primary_language ? [client.primary_language] : [],
         aac_status: client.aac_status ?? (client.uses_aac ? 'emerging' : 'none'),
-        communication_modality: client.communication_modality ?? null
+        communication_modality: client.communication_modality ?? null,
+        // Phase 4.0.7.23a — surface the clinical area pick to Claude
+        // verbatim. Both the short_code (machine grouping) and the
+        // human label (semantic anchor in the prompt) are passed.
+        clinical_area: clinical_area ?? null,
+        clinical_area_label: clinical_area_label ?? null
       },
-      clarifying_answers,
+      clarifying_answers: clarifying_answers ?? null,
       session_notes: sessions.map(s => {
         const date = s.session_date ? `(${s.session_date})` : '';
         return [s.soap_note, s.session_summary, s.goals_addressed].filter(Boolean).join(' ').trim() || `Session ${date}: No notes recorded`;
       }),
       assessments: existingGoals.length ? [`Existing active goals: ${existingGoals.map(g => g.goal_text).join('; ')}`] : [],
       intake_notes: client.additional_notes ?? null,
-      clinician_hypothesis: req.body.clinician_hypothesis ?? null
+      clinician_hypothesis: req.body.clinician_hypothesis ?? null,
+      // Phase 4.0.7.23a — domain-scoped framework grounding. Claude
+      // should treat these as the primary evidence base when picking
+      // LTG/STO direction. Each entry: short_code, name, description,
+      // key_authors, evidence_level, when_to_use.
+      framework_grounding: frameworks
     };
 
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
