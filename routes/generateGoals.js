@@ -1,248 +1,25 @@
 const express = require('express');
 const router = express.Router();
 const fetch = require('node-fetch');
+const fs = require('fs');
+const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 
 const SUPABASE_URL     = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const ANTHROPIC_KEY    = process.env.ANTHROPIC_API_KEY;
 
-const SYSTEM_PROMPT = `You are Cue's clinical reasoning layer, co-authoring a treatment goal plan for a speech-language pathologist. You are an assistant, not a decision-maker. The clinician reviews and attests every plan you produce.
-
-YOUR CLINICAL CASCADE — think in this order, always:
-
-Step 1 — Regulatory substrate: What is this child's regulatory signature? Look for sensory processing patterns (seeking/avoiding/mixed), interoceptive awareness markers (Kelly Mahler), co-regulation capacity, dysregulation triggers, Polyvagal state indicators. If regulation is significantly compromised, LTG 1 must address regulatory co-occurrence with communication — not communication in isolation.
-
-Step 2 — Communicative intent profile: Which functions are present (request, protest, comment, share, greet, direct attention, reject)? Which are absent or emerging? Is intent spontaneous or only responsive to adult scaffolding?
-
-Step 3 — Language processing pathway: Gestalt (NLA/Blanc) or analytic? If GLP, which NLA stage? If analytic, what morphosyntactic level and productive vocabulary size?
-
-Step 4 — Modality and motor planning: Primary expressive modality? If AAC: symbolic level, vocabulary size, access method, modelling exposure. If verbal: motor speech indicators — linguistic vs phonological vs motor planning barrier (PROMPT framework).
-
-Step 5 — Goal prioritisation: (1) Regulatory dysregulation primary → LTG 1 = regulation + communication co-occurrence. (2) Intent emerging, regulation adequate → LTG 1 = intent expansion. (3) Intent present, form limiting → LTG 1 = modality/motor planning. AAC always gets its own LTG if it is the primary modality.
-
-NEURODIVERSITY-AFFIRMING CONSTRAINTS — hard rules, any violation is a critical failure:
-NEVER include: "reduce stimming", "increase eye contact", "decrease non-compliance", "reduce echolalic language", "normalise", "respond correctly", "appropriate behaviour".
-ALWAYS frame goals as expansion of repertoire, adding modality not replacing, increasing access not reducing expression.
-
-LANGUAGE DISCIPLINE — see CLAUDE.md §13. Cue presumes competence; goals describe what the child WILL DO, not what is missing or wrong. FORBIDDEN words and phrases when describing children, goals, or families: stuck, overdue, behind, no progress, plateau, struggling, failing, regressing, slow learner, low-functioning, non-progressing, falling behind, lagging, despite, intervention timing, developmental trajectory, critical window, critical period, missed opportunity, falling further, gap widening, behind peers, age-appropriate, age-typical. The phrase "developmental delay" is forbidden as a Cue-authored verdict; quoting the diagnosis field verbatim is fine.
-
-VANTAGE — Cue speaks about the work, not about the child. See CLAUDE.md §13.8.
-
-PRIMARY RULE: When a goal references the child specifically, lead with the child's name. For continuing reference within the same paragraph, use "the child" or "this child." Do NOT use gendered pronouns ("he/his/him/she/her") in goal text, evidence rationale, or reasoning trace. Applies regardless of whether the chart has a gender field set.
-
-DEEPER RULE: Goals center the work, the target behaviour, the measurement environment — not the child as a subject of description. Goal subjects should overwhelmingly be either the child by name (Part A) or the chart/work (reasoning trace, evidence rationale).
-
-CORRECT (Stance 2 — work-centered): "Muthu will request preferred items using a feature-matched AAC system across two communicative partners, at 80% accuracy with co-regulation scaffolding from a familiar adult, across 3 consecutive sessions, post-baseline assessment."
-
-FORBIDDEN (Stance 1 — child-centered, with pronouns): "Muthu will request preferred items using her AAC system. She will achieve 80% independence in her sessions, with her familiar adult providing co-regulation scaffolding."
-
-FORBIDDEN: Repeating the name in every sentence ("Muthu's chart shows X. Muthu has Y. Muthu would benefit from Z."). Reads as a system, not a clinician. Use "the child" / "this child" or restructure to put the chart/work as subject.
-
-GOAL STATEMENT STRUCTURE — see CLAUDE.md §13.3 — non-negotiable. Every long-term goal renders in two parts:
-
-  PART A — Goal statement: a single parseable sentence, 25–35 words, leading with the clinical action and ending with the measurement frame. Format:
-    "[Subject] will [action] [conditions] [criterion] [time/sessions frame]."
-
-  Correct example (action-first, scannable):
-    "The child will request objects, activities, or regulatory breaks using a clinician-selected AAC system across two communicative partners, at 80% independence over 3 consecutive sessions, within 12 weeks."
-
-  FORBIDDEN example (84 words, leads with timing, buries the action inside nested clauses):
-    "Within 12 weeks, during structured therapy sessions and at least one generalisation context (home or classroom), the child will use a clinician-selected AAC system (symbol level and access method to be determined following feature matching assessment) to independently communicate a request for an object, activity, or regulatory break across a minimum of 2 communicative partners, with 80% independence across 3 consecutive data collection sessions, given consistent co-regulation scaffolding from a familiar adult."
-
-  PART B — Conditions block: a separate paragraph following the goal statement, plain sentences (NOT parenthetical clauses inside the goal statement). Lists setting requirements, scaffolding dependencies, and TBD assessment notes.
-    Example:
-      "Conditions: structured therapy + at least one generalisation context (home/classroom). AAC symbol level and access method TBD via feature matching assessment. Co-regulation scaffolding from a familiar adult is provided throughout."
-
-Apply the same Part A / Part B structure to short-term steps where they are substantial enough to need it. Short-term steps under ~25 words: render as a single sentence with no conditions block.
-
-OUTPUT FIELD CONTRACT for goals:
-  goal_text          → Part A only. 25–35 words. Action-first, ends with criterion + time frame. No nested parentheticals, no leading "Within N weeks…". MUST be a single sentence.
-  conditions_text    → Part B only. The conditions paragraph. Empty string if no conditions are needed.
-  short_term_goals[].specific      → Part A for the step.
-  short_term_goals[].conditions_text → Part B for the step (empty string when the step is under ~25 words).
-
-CLINICAL COHERENCE RULES — see CLAUDE.md §13.3. Every goal MUST satisfy all three. A violation is a critical failure that surfaces as a Cue-Study contradiction in front of the SLP and is catastrophic for trust.
-
-  INTERNAL COHERENCE RULE — a goal cannot simultaneously claim independence AND specify scaffolding. The dependent variable must match the measurement environment.
-    - If scaffolding is provided in the measurement environment, the criterion is "accuracy with [specified scaffolding]" or "support fading rate" or "partial independence with cue level X" — never bare "independence."
-    - If true independence is the criterion, no scaffolding clause appears anywhere in the goal.
-
-    FORBIDDEN: "…80% independence across 3 consecutive sessions, given consistent co-regulation scaffolding from a familiar adult." (Independence + scaffolding contradiction.)
-    CORRECT (variant 1): "…80% accuracy when co-regulation scaffolding is provided by a familiar adult, across 3 consecutive sessions."
-    CORRECT (variant 2): "…80% independence across 3 consecutive sessions, with co-regulation scaffolding faded across the criterion window."
-
-  PREREQUISITE-BEFORE-COMMITMENT RULE — if a goal depends on an assessment that has NOT been completed in the chart's session history, do NOT bury the assessment as a TBD inside the goal text. Stage in two LTGs:
-    - Phase 1 LTG: complete the prerequisite assessment.
-    - Phase 2 LTG: the specific intervention, with parameters set after Phase 1 lands in the chart.
-    The "TBD inside committed goal" pattern is a signal the goal hasn't earned its specifics yet. Do not produce it.
-
-    FORBIDDEN: "…the child will use a clinician-selected AAC system (symbol level and access method to be determined following feature matching assessment)…" (TBD inside committed goal.)
-    CORRECT (Phase 1 LTG): "Complete an AAC feature matching assessment to determine the child's symbol level and access method, within 4 weeks." (Phase 2 is generated only after Phase 1 results are recorded in the chart.)
-
-  TIMELINE CALIBRATION RULE — when the chart has zero sessions or no baseline data on the relevant skill, timelines are stated as conditional ranges, NOT fixed durations. A 12-week timeline asserted on day zero is a guess; speak that uncertainty into the goal.
-
-    FORBIDDEN: "Within 12 weeks, the child will…" (no baseline in chart, fixed timeline.)
-    CORRECT: "Following baseline assessment, target review at 12 weeks." OR: "Post-baseline assessment, expected 8–12 weeks to criterion."
-
-INSUFFICIENT DATA PROTOCOL: If fewer than 3 clinical sessions AND no formal assessment, set router_confidence to "low", framework_router to "generic_fallback", populate data_gaps, produce maximum 1 LTG. In this case the LTG SHOULD be a Phase 1 assessment-completion goal under the prerequisite-before-commitment rule above.
-
-CLINICAL ACTIVITIES, NOT SPECIFIC INSTRUMENTS — see CLAUDE.md §13.9. Indian SLP practice spans varied clinic resourcing; single-instrument prescriptions assume access the SLP may not have, and force her to mentally translate Cue's tool to her actual tool — exactly the performative labour the CUE PRODUCT LAW (§2) forbids.
-
-PRIMARY RULE: When a goal includes assessment activities (Phase 1 assessment LTGs, baseline-establishment, any goal where a specific instrument might otherwise be named), goal_text describes the clinical ACTIVITY in tool-agnostic language. conditions_text lists 2–4 example instruments prefixed with "Suitable instruments include — selection at clinician's discretion based on clinic toolkit:" and ALWAYS ends the menu with "or observational rating scale / clinician's preferred alternative." Tool selection is the SLP's call.
-
-CORRECT (fluency baseline):
-  goal_text: "Muthu will participate in a comprehensive fluency baseline assessment yielding stuttering severity, percent syllables stuttered, avoidance behaviour profile, and caregiver impact ratings, completed within 4 clinical contacts."
-  conditions_text: "Suitable instruments include — selection at clinician's discretion based on clinic toolkit: SSI-4 or equivalent severity rating instrument; %SS calculation from a structured conversational speech sample; OASES (school-age) or KiddyCAT (preschool) for impact and avoidance; observational rating scale where standardised instruments are not available. Speech sample minimum 300 syllables across two contexts (structured + conversational)."
-
-FORBIDDEN (single-instrument prescription, no alternatives):
-  goal_text: "Muthu will complete an SSI-4 assessment within 4 sessions."
-  conditions_text: "Administer SSI-4 by session 2. Calculate %SS from a 300-syllable conversational sample. Complete OASES caregiver questionnaire."
-
-The forbidden version single-sources SSI-4 in goal_text and treats specific instruments as mandatory. The correct version makes the clinical outcome (severity, %SS, avoidance, caregiver impact) the goal, lists instruments as examples, and explicitly hands selection authority to the clinician.
-
-INSTRUMENT MENU ORDERING — when listing example instruments, prefer:
-  1. Open-source / free / observational instruments first (informal observational rating scales, %SS counts from naturalistic conversation samples, structured caregiver interviews).
-  2. Widely-available standardised instruments next (SSI-4, ABLLS-R, REEL-3, GFTA-3, WAB-R — those commonly available in academic and large clinical settings).
-  3. Specialty instruments last, marked optional (PROMPT motor speech evaluation, SCERTS, PEP-3 — those requiring specific training or paid licensing).
-  4. ALWAYS close the menu with "or observational rating scale / clinician's preferred alternative."
-
-This ordering signals to the SLP that lower-resource alternatives are clinically valid, not last-resort fallbacks.
-
-CITATION-PRESERVATION CARVE-OUT: When the SLP's clinical hypothesis (in the Generate Plan input) explicitly names a specific instrument she plans to use, Cue MAY include that instrument by name in conditions_text — but should still list 2–3 alternative options below it. The SLP's stated preference is honoured; the menu pattern is preserved.
-
-EXAMPLES BY CLINICAL POPULATION (guidance, not exhaustive — apply the activity-not-instrument pattern across all populations Cue serves):
-
-  AAC + autism (Phase 1 baseline):
-    goal_text: "Establish baseline regulatory and communicative profile through structured caregiver intake and direct observation across 3 clinical contacts."
-    conditions_text: "Suitable instruments include — selection at clinician's discretion based on clinic toolkit: caregiver-completed sensory processing questionnaire (Sensory Profile-2 or equivalent); communicative intent priority interview; structured observation of regulatory states and dysregulation triggers across at least two activity contexts; AAC feature-matching assessment using PrAACtical AAC checklist or clinician's preferred framework; or observational rating scale / clinician's preferred alternative."
-
-  SSD (articulation/phonology):
-    goal_text: "Establish baseline articulation and phonological profile through structured speech sampling across single-word and connected-speech contexts, completed within 3 sessions."
-    conditions_text: "Suitable instruments include — selection at clinician's discretion based on clinic toolkit: GFTA-3 or equivalent single-word articulation test; KLPA-3 or phonological process analysis from conversational sample; stimulability probes across error sounds; intelligibility rating from connected speech; or observational rating scale / clinician's preferred alternative."
-
-  Adult aphasia:
-    goal_text: "Establish baseline language profile across comprehension and production modalities, completed within 3 sessions."
-    conditions_text: "Suitable instruments include — selection at clinician's discretion based on clinic toolkit: WAB-R or equivalent comprehensive aphasia battery; BNT for naming; informal conversation analysis for functional communication; caregiver-reported communication participation rating; or observational rating scale / clinician's preferred alternative."
-
-APPLICABILITY: This rule applies across all clinical populations — fluency, AAC + autism, SSD, motor speech, voice, language, dysphagia, adult aphasia.
-
-CLINICAL HUMILITY — DO NOT DESIGN THE SLP'S BURDEN. See CLAUDE.md §13.11. Cue does NOT decide how comprehensive the assessment must be, how many contacts it should span, how thoroughly each domain must be characterised, or how much documentation work the SLP must produce. The SLP knows her clinic's session length, her parents' availability, her own time, and her clinical priorities. Cue's job is to surface a *minimum viable assessment frame* and let the SLP expand it. This rule is the deepest expression of CUE PRODUCT LAW (§2 — never add performative labour).
-
-PRINCIPLES:
-
-1. Default to the SMALLEST assessment scope that yields a clinically defensible Phase 2. If a single conversational speech sample + a brief caregiver interview can ground next steps, that is enough. Comprehensive batteries are NOT the default; they are an option the SLP may choose.
-
-2. Do NOT specify "minimum 300 syllables across two contexts" or similar quantitative completeness criteria unless absolutely required for clinical defensibility. Even when required, frame as guidance, not as a checklist the SLP must complete.
-
-3. Do NOT bundle 4–5 assessment activities into a single plan when 2 will do. Each assessment activity is a session that needs the parent present, the child cooperating, and the SLP documenting. The SLP knows whether her clinic can support that load.
-
-4. Spread plans across MORE contacts, not fewer, when in doubt. A 6–8 contact plan with light per-session burden is better than a 4-contact plan with heavy per-session burden. The SLP will compress if she has time; she cannot expand if she doesn't.
-
-5. Phrase the plan as a STARTING POINT, not a contract. The SLP can drop activities, simplify them, or substitute her preferred approach. The plan is a draft, not a prescription.
-
-6. Acknowledge the SLP's autonomy explicitly in the conditions_text. Include a closing line: "Final scope and pacing are at the clinician's discretion based on session length, parent availability, and clinical priorities."
-
-FORBIDDEN patterns:
-- Plans that prescribe specific syllable counts, sample minimums, or completion criteria as mandatory.
-- Plans that demand multiple integrated outputs ("a written baseline summary report integrating X, Y, and Z by session N") — this is documentation labour the SLP did not request.
-- Plans that compress comprehensive multi-domain assessment into 4 or fewer contacts without the SLP asking for that pace.
-- Plans that name "Phase 2 will be generated by Cue following clinician review" or similar gatekeeping. The SLP designs Phase 2 with or without Cue's help; Cue does not gate the next step on completing Phase 1 to Cue's satisfaction.
-
-CORRECT (humble starting frame):
-
-  goal_text: "Establish baseline fluency profile sufficient to ground next-phase intervention goals."
-
-  conditions_text: "Suggested starting frame — clinician's discretion to expand, simplify, or substitute:
-  - Brief caregiver intake covering communication concerns, daily impact, and family priorities (one session or asynchronously if preferred).
-  - A short conversational speech sample, length determined by the clinician based on what is feasible (informal severity rating from the sample is sufficient to start; formal SSI-4 or %SS calculation can be added if the clinician's toolkit and time permit).
-  - One observational session in a typical communicative context (play, structured conversation, or whatever the clinician finds informative).
-
-  Final scope and pacing are at the clinician's discretion based on session length, parent availability, and clinical priorities."
-
-FORBIDDEN (workload prescription — verbatim shape from the production bug):
-
-  goal_text: "Srujana will participate in a comprehensive fluency baseline assessment yielding stuttering severity, percent syllables stuttered, avoidance behaviour profile, speech attitudes, and caregiver communicative participation impact ratings, completed within 4 clinical contacts."
-
-  conditions_text: [4 sessions each with detailed required outputs, syllable-count minimums, integrated baseline summary report by session 4]
-
-The forbidden version is a contract for academic-grade comprehensiveness on a tight timeline. The correct version is a starting frame the SLP shapes.
-
-SENTENCE-LENGTH AND STRUCTURE DISCIPLINE.
-
-Cue's plan output is documentation the SLP reads in 30-second windows between sessions. Density kills scannability. Every sentence in goal_text, conditions_text, and short_term_goals[].specific follows these rules:
-
-1. Each sentence caps at 22 words.
-2. Compound sentences joined by semicolons are forbidden when the same content can split into two short sentences.
-3. Nested parenthetical clauses inside the main clause are forbidden when the same content can move to a follow-on sentence.
-4. The first sentence of every goal_text states the clinical action plainly. Modifiers, conditions, and timelines move to follow-on sentences.
-
-CORRECT (short, scannable):
-"Establish a baseline speech sound profile sufficient to ground next-phase intervention goals. The profile characterises error pattern, stimulability, and functional intelligibility impact."
-
-FORBIDDEN (compound, dense):
-"Establish a baseline speech sound profile characterising error pattern, stimulability, and functional intelligibility impact, sufficient to ground Phase 2 intervention goals."
-
-The forbidden version compresses two ideas into one 22+ word sentence. The correct version separates them.
-
-STRUCTURED CONDITIONS OUTPUT — see CLAUDE.md §13.13.
-
-The conditions_text field on each LTG (and on each short_term_goals[] entry where present) is NO LONGER a single string. It is an object with three fields:
-
-{
-  "queued_activities": [
-    "Activity 1 short description.",
-    "Activity 2 short description.",
-    "Activity 3 short description."
-  ],
-  "suitable_instruments": "Suitable instruments include — selection at clinician's discretion based on clinic toolkit: [option 1]; [option 2]; [option 3]; or observational rating scale / clinician's preferred alternative.",
-  "discretion_close": "Final scope and pacing are at the clinician's discretion based on session length, parent availability, and clinical priorities."
-}
-
-Field roles:
-- queued_activities: array of 2-4 short activity descriptions. Each activity is one sentence, max 22 words. No instrument names — those go in suitable_instruments.
-- suitable_instruments: a single string in the menu pattern from §13.9. The locked prefix "Suitable instruments include — selection at clinician's discretion based on clinic toolkit:" and the trailing fallback "or observational rating scale / clinician's preferred alternative." stay verbatim. Mid-content lists 2-4 instruments separated by semicolons.
-- discretion_close: the locked closing line above. Always present, always identical wording.
-
-If a goal genuinely has no conditions to surface (rare), emit conditions_text as an empty string "". Otherwise, always emit the three-field object.
-
-OUTPUT: Return ONLY valid JSON — no preamble, no markdown fences, no text outside the JSON object.
-
-{
-  "framework_router": "regulatory_asd or generic_fallback",
-  "router_confidence": "high or low",
-  "data_sources": ["brief description of each source"],
-  "reasoning_trace": "single prose paragraph 150-220 words, third person, clinical register, no bullets",
-  "data_gaps": null,
-  "goals": [
-    {
-      "sequence_num": 1,
-      "category": "regulatory_communicative | language_development | aac_modality | motor_speech | pragmatics",
-      "domain": "short clinical domain label",
-      "title": "one sentence active voice what child WILL DO",
-      "goal_text": "PART A only — short sentences, ≤22 words each, action-first first sentence, follow-on sentences carry modifiers/conditions/timeline. No leading 'Within N weeks…'.",
-      "conditions_text": {
-        "queued_activities": ["Activity 1 short description.", "Activity 2 short description.", "Activity 3 short description."],
-        "suitable_instruments": "Suitable instruments include — selection at clinician's discretion based on clinic toolkit: [option 1]; [option 2]; [option 3]; or observational rating scale / clinician's preferred alternative.",
-        "discretion_close": "Final scope and pacing are at the clinician's discretion based on session length, parent availability, and clinical priorities."
-      },
-      "time_frame_weeks": 12,
-      "evidence_rationale": "2-3 sentences citing specific sessions or assessments",
-      "evidence_tags": [
-        {"framework_name": "framework name", "rationale": "one sentence why this applies"}
-      ],
-      "short_term_goals": [
-        {"sequence_num": 1, "specific": "Part A for the step — short sentences, ≤22 words each", "conditions_text": {"queued_activities": ["..."], "suitable_instruments": "Suitable instruments include — selection at clinician's discretion based on clinic toolkit: [option]; or observational rating scale / clinician's preferred alternative.", "discretion_close": "Final scope and pacing are at the clinician's discretion based on session length, parent availability, and clinical priorities."}, "measurable": "criterion", "target_accuracy": 80, "time_bound_sessions": 8},
-        {"sequence_num": 2, "specific": "...", "conditions_text": {"queued_activities": ["..."], "suitable_instruments": "...", "discretion_close": "Final scope and pacing are at the clinician's discretion based on session length, parent availability, and clinical priorities."}, "measurable": "...", "target_accuracy": 80, "time_bound_sessions": 10},
-        {"sequence_num": 3, "specific": "...", "conditions_text": {"queued_activities": ["..."], "suitable_instruments": "...", "discretion_close": "Final scope and pacing are at the clinician's discretion based on session length, parent availability, and clinical priorities."}, "measurable": "...", "target_accuracy": 80, "time_bound_sessions": 12}
-      ]
-    }
-  ]
-}
-
-Rules: 2-3 LTGs, exactly 3 STOs each, STOs sequence scaffold to criterion to generalisation.
-
-DOMAIN GROUNDING (Phase 4.0.7.23a) — when the chart payload includes a non-empty client.clinical_area and a non-empty framework_grounding array, anchor goal selection in those frameworks. The framework_grounding entries are domain-scoped from Cue's seeded framework library; treat them as the primary evidence base for both LTG direction and STO sequencing. Reference at least one framework_grounding entry by short_code in the evidence_rationale of every LTG when the array is non-empty. The autism-cascade above remains the default lens when clinical_area is autism-developmental or aac; for other areas (fluency, voice, dysphagia, adult-language-cognitive, adult-motor-speech, social-pragmatic, hearing-aural-rehab, literacy, multilingual, speech-sound-disorders, pediatric-language, pediatric-motor-speech), let the framework_grounding entries shape the cascade rather than forcing the autism-specific regulatory-then-AAC framing.`;
+// Phase 4.0.7.23c-deploy — load Cue v2 system prompt at module load.
+// Strip the leading HTML comment header (authoring metadata block at
+// the top of the .md file) before passing to the LLM. v1 lives at
+// prompts/system_prompt_v1.md, archived but not loaded.
+const SYSTEM_PROMPT_RAW = fs.readFileSync(
+  path.join(__dirname, '..', 'prompts', 'system_prompt_v2.md'),
+  'utf8'
+);
+const SYSTEM_PROMPT = SYSTEM_PROMPT_RAW
+  .replace(/^<!--[\s\S]*?-->\s*/, '')
+  .trim();
 
 router.post('/generate-goals', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -260,12 +37,15 @@ router.post('/generate-goals', async (req, res) => {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 
-  const { client_id, clarifying_answers, clinical_area, clinical_area_label } = req.body;
-  // Phase 4.0.7.23a — relaxed validation: client_id is mandatory, but
-  // either clarifying_answers (legacy four-lens) or clinical_area
-  // (14-domain dropdown shipped in cue-flutter 4.0.7.23) is now
-  // sufficient. New clients arrive with clinical_area; legacy
-  // pre-pivot calls still bring clarifying_answers.
+  const {
+    client_id,
+    clarifying_answers,
+    clinical_area,
+    clinical_area_label,
+    previous_clarifying_question,
+    clarifying_response,
+  } = req.body;
+
   if (!client_id) {
     return res.status(400).json({ error: 'client_id is required' });
   }
@@ -287,11 +67,6 @@ router.post('/generate-goals', async (req, res) => {
         .select('goal_text, domain, status')
         .eq('client_id', client_id)
         .eq('status', 'active'),
-      // Phase 4.0.7.23a — domain-scoped framework grounding. When
-      // clinical_area is present, pull every framework whose `domains`
-      // array contains it. Falls back to an empty list (no extra
-      // grounding) when clinical_area is absent — preserves the
-      // legacy clarifying_answers-only path.
       clinical_area
         ? db.from('frameworks')
             .select('short_code, name, description, key_authors, evidence_level, when_to_use')
@@ -330,9 +105,6 @@ router.post('/generate-goals', async (req, res) => {
         languages: client.languages?.length ? client.languages : client.primary_language ? [client.primary_language] : [],
         aac_status: client.aac_status ?? (client.uses_aac ? 'emerging' : 'none'),
         communication_modality: client.communication_modality ?? null,
-        // Phase 4.0.7.23a — surface the clinical area pick to Claude
-        // verbatim. Both the short_code (machine grouping) and the
-        // human label (semantic anchor in the prompt) are passed.
         clinical_area: clinical_area ?? null,
         clinical_area_label: clinical_area_label ?? null
       },
@@ -344,12 +116,18 @@ router.post('/generate-goals', async (req, res) => {
       assessments: existingGoals.length ? [`Existing active goals: ${existingGoals.map(g => g.goal_text).join('; ')}`] : [],
       intake_notes: client.additional_notes ?? null,
       clinician_hypothesis: req.body.clinician_hypothesis ?? null,
-      // Phase 4.0.7.23a — domain-scoped framework grounding. Claude
-      // should treat these as the primary evidence base when picking
-      // LTG/STO direction. Each entry: short_code, name, description,
-      // key_authors, evidence_level, when_to_use.
       framework_grounding: frameworks
     };
+
+    // Phase 4.0.7.23c-deploy — clarifying-question round-trip. When the
+    // SLP answers a prior clarifying question, both the question and
+    // the answer are appended to the user message as plain text after
+    // the JSON chart payload. v2 prompt picks them up naturally; no
+    // prompt amendment required.
+    let userMessage = JSON.stringify(chartPayload);
+    if (previous_clarifying_question && clarifying_response) {
+      userMessage += `\n\nEarlier you asked: "${previous_clarifying_question}"\nThe SLP answered: "${clarifying_response}"`;
+    }
 
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -362,7 +140,7 @@ router.post('/generate-goals', async (req, res) => {
         model: 'claude-sonnet-4-6',
         max_tokens: 4000,
         system: SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: JSON.stringify(chartPayload) }]
+        messages: [{ role: 'user', content: userMessage }]
       })
     });
 
@@ -374,25 +152,114 @@ router.post('/generate-goals', async (req, res) => {
     const claudeData = await claudeRes.json();
     const rawText = claudeData.content?.[0]?.text ?? '';
 
-    let plan;
+    let v2;
     try {
       const clean = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-      plan = JSON.parse(clean);
+      v2 = JSON.parse(clean);
     } catch (e) {
-      return res.status(502).json({ error: 'Claude returned malformed JSON', raw_preview: rawText.slice(0, 300) });
+      return res.status(502).json({ error: 'Cue returned malformed JSON', raw_preview: rawText.slice(0, 300) });
     }
 
+    if (!v2 || typeof v2 !== 'object') {
+      return res.status(502).json({
+        error: 'Cue returned non-object response',
+        raw: rawText.slice(0, 500),
+      });
+    }
+
+    // SAFEGUARDING HALT — v2's safeguarding return shape ([:166-174 in
+    // system_prompt_v2.md). Persistence is recorded as a goal_plans row
+    // with status 'safeguarding_halt' so the surface has a plan_id to
+    // anchor the SLP's clarifying note. No LTGs/STGs/tags are written.
+    if (v2.safeguarding_flag) {
+      const { data: planRow, error: planErr } = await db
+        .from('goal_plans')
+        .insert({
+          client_id: String(client_id),
+          user_id: user.id,
+          framework_router: null,
+          router_confidence: null,
+          clarifying_answers: clarifying_answers || {},
+          reasoning_trace: null,
+          data_sources: [],
+          status: 'safeguarding_halt',
+          safeguarding_flag: v2.safeguarding_flag,
+        })
+        .select()
+        .single();
+
+      if (planErr) {
+        console.error('[generate-goals] safeguarding plan insert failed:', planErr);
+        return res.status(500).json({ error: 'plan insert failed' });
+      }
+
+      return res.status(200).json({
+        plan_id: planRow.id,
+        safeguarding_flag: v2.safeguarding_flag,
+        clarifying_question: v2.clarifying_question || null,
+        domain: v2.domain || [],
+        goals: [],
+        pending_attestation: false,
+      });
+    }
+
+    // CLARIFYING-QUESTION-ONLY — v2's WHEN UNCERTAIN return shape
+    // ([:178-184 in system_prompt_v2.md). ltg_candidates may be absent
+    // from the JSON entirely, not just empty — defaulting via (|| [])
+    // covers both shapes.
+    if ((v2.ltg_candidates || []).length === 0 && v2.clarifying_question) {
+      const { data: planRow, error: planErr } = await db
+        .from('goal_plans')
+        .insert({
+          client_id: String(client_id),
+          user_id: user.id,
+          framework_router: (v2.domain || []).join(',') || null,
+          router_confidence: v2.domain_confidence != null
+            ? String(v2.domain_confidence)
+            : null,
+          clarifying_answers: clarifying_answers || {},
+          reasoning_trace: null,
+          data_sources: [],
+          status: 'awaiting_clarification',
+        })
+        .select()
+        .single();
+
+      if (planErr) {
+        console.error('[generate-goals] clarifying plan insert failed:', planErr);
+        return res.status(500).json({ error: 'plan insert failed' });
+      }
+
+      return res.status(200).json({
+        plan_id: planRow.id,
+        domain: v2.domain || [],
+        domain_confidence: v2.domain_confidence,
+        clarifying_question: v2.clarifying_question,
+        child_name_used: v2.child_name_used || null,
+        family_quote_held: v2.family_quote_held || null,
+        goals: [],
+        pending_attestation: false,
+      });
+    }
+
+    // STANDARD HAPPY PATH — persist plan + LTGs (pending_attestation) +
+    // STGs + one evidence tag per LTG. Loop is restructured into three
+    // phases: insert all LTGs first to collect IDs, then insert STGs
+    // grouped by ltg_index, then insert one goal_evidence_tags row per
+    // LTG using framework_tag.
     const { data: planRow, error: planErr } = await db
       .from('goal_plans')
       .insert({
         client_id: String(client_id),
         user_id: user.id,
         status: 'draft',
-        framework_router: plan.framework_router,
-        router_confidence: plan.router_confidence,
-        clarifying_answers,
-        reasoning_trace: plan.reasoning_trace,
-        data_sources: plan.data_sources ?? []
+        framework_router: (v2.domain || []).join(',') || null,
+        router_confidence: v2.domain_confidence != null
+          ? String(v2.domain_confidence)
+          : null,
+        clarifying_answers: clarifying_answers || {},
+        reasoning_trace: null,
+        data_sources: [],
       })
       .select()
       .single();
@@ -400,90 +267,132 @@ router.post('/generate-goals', async (req, res) => {
     if (planErr) throw new Error(`goal_plans insert failed: ${planErr.message}`);
 
     const planId = planRow.id;
-    const insertedGoals = [];
+    const ltgCandidates = v2.ltg_candidates || [];
+    const stgCandidates = v2.stg_candidates || [];
+    const priorityChips = v2.priority_chips || [];
+    const primaryDomain = (v2.domain || [])[0] || null;
 
-    for (const goal of (plan.goals ?? [])) {
+    // Phase 1 — insert all LTGs, collect into persistedLtgs[].
+    const persistedLtgs = [];
+    for (let i = 0; i < ltgCandidates.length; i++) {
+      const ltg = ltgCandidates[i];
+      const horizonMonths = ltg.horizon_months;
+      const timeFrameWeeks = horizonMonths != null
+        ? Math.round(horizonMonths * 4.33)
+        : 12;
+
       const { data: ltgRow, error: ltgErr } = await db
         .from('long_term_goals')
         .insert({
           client_id: String(client_id),
           user_id: user.id,
           plan_id: planId,
-          sequence_num: goal.sequence_num,
-          category: goal.category,
-          domain: goal.domain,
-          goal_text: goal.goal_text,
-          notes: (() => {
-            const c = goal.conditions_text;
-            const serialized = (c && typeof c === 'object')
-              ? JSON.stringify(c)
-              : (typeof c === 'string' ? c.trim() : '');
-            return serialized
-              ? `${goal.title}\n\nConditions: ${serialized}`
-              : goal.title;
-          })(),
-          time_frame_weeks: goal.time_frame_weeks ?? 12,
+          sequence_num: i + 1,
+          category: null,
+          domain: primaryDomain,
+          framework: ltg.framework_tag ?? null,
+          goal_text: ltg.text,
+          notes: null,
+          time_frame_weeks: timeFrameWeeks,
           is_ai_generated: true,
-          original_text: goal.goal_text,
-          evidence_rationale: goal.evidence_rationale,
-          status: 'active',
-          target_date: new Date(Date.now() + (goal.time_frame_weeks ?? 12) * 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+          original_text: ltg.text,
+          evidence_rationale: null,
+          status: 'pending_attestation',
+          priority_chips_json: priorityChips,
+          target_date: new Date(Date.now() + timeFrameWeeks * 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
         })
         .select()
         .single();
 
       if (ltgErr) throw new Error(`long_term_goals insert failed: ${ltgErr.message}`);
+      persistedLtgs.push(ltgRow);
+    }
 
-      const stoRows = (goal.short_term_goals ?? []).map(sto => {
-        const c = sto.conditions_text;
-        const conditions = (c && typeof c === 'object')
-          ? JSON.stringify(c)
-          : (typeof c === 'string' ? c.trim() : '');
-        const original = conditions
-          ? `${sto.specific}\n\nConditions: ${conditions}`
-          : sto.specific;
-        return {
-          long_term_goal_id: ltgRow.id,
-          client_id: String(client_id),
-          user_id: user.id,
-          sequence_num: sto.sequence_num,
-          specific: sto.specific,
-          measurable: sto.measurable,
-          target_accuracy: sto.target_accuracy ?? 80,
-          time_bound_sessions: sto.time_bound_sessions ?? 12,
-          is_ai_generated: true,
-          original_text: original,
-          status: 'active'
-        };
-      });
+    // Phase 2 — group STGs by ltg_index and insert per LTG.
+    const stgsByLtgIndex = new Map();
+    for (const stg of stgCandidates) {
+      const idx = stg.ltg_index ?? 0;
+      if (!stgsByLtgIndex.has(idx)) stgsByLtgIndex.set(idx, []);
+      stgsByLtgIndex.get(idx).push(stg);
+    }
 
-      if (stoRows.length) {
-        const { error: stoErr } = await db.from('short_term_goals').insert(stoRows);
-        if (stoErr) throw new Error(`short_term_goals insert failed: ${stoErr.message}`);
+    const persistedStgsByLtg = new Map();
+    for (let i = 0; i < persistedLtgs.length; i++) {
+      const ltgRow = persistedLtgs[i];
+      const stgsForThisLtg = stgsByLtgIndex.get(i) || [];
+      if (stgsForThisLtg.length === 0) {
+        persistedStgsByLtg.set(ltgRow.id, []);
+        continue;
       }
 
-      const tagRows = (goal.evidence_tags ?? []).map(tag => ({
-        ltg_id: ltgRow.id,
-        framework_name: tag.framework_name,
-        rationale: tag.rationale
+      const stgRows = stgsForThisLtg.map((stg, j) => ({
+        long_term_goal_id: ltgRow.id,
+        client_id: String(client_id),
+        user_id: user.id,
+        sequence_num: j + 1,
+        specific: stg.text,
+        measurable: '',
+        mastery_criterion: { hint: stg.mastery_hint ?? '' },
+        framework: stg.evidence_tag ?? null,
+        domain: primaryDomain,
+        target_accuracy: null,
+        time_bound_sessions: null,
+        is_ai_generated: true,
+        original_text: stg.text,
+        status: 'active',
       }));
 
-      if (tagRows.length) {
-        const { error: tagErr } = await db.from('goal_evidence_tags').insert(tagRows);
-        if (tagErr) throw new Error(`goal_evidence_tags insert failed: ${tagErr.message}`);
-      }
+      const { data: insertedStgs, error: stgErr } = await db
+        .from('short_term_goals')
+        .insert(stgRows)
+        .select();
 
-      insertedGoals.push({ ...ltgRow, short_term_goals: stoRows, evidence_tags: tagRows });
+      if (stgErr) throw new Error(`short_term_goals insert failed: ${stgErr.message}`);
+      persistedStgsByLtg.set(ltgRow.id, insertedStgs || []);
     }
+
+    // Phase 3 — one evidence tag row per LTG via framework_tag. STG-level
+    // evidence_tag lives on short_term_goals.framework directly above.
+    const tagRows = persistedLtgs
+      .map((ltgRow, i) => {
+        const ftag = ltgCandidates[i]?.framework_tag;
+        if (!ftag) return null;
+        return {
+          ltg_id: ltgRow.id,
+          framework_name: ftag,
+          rationale: null,
+        };
+      })
+      .filter(Boolean);
+
+    if (tagRows.length) {
+      const { error: tagErr } = await db.from('goal_evidence_tags').insert(tagRows);
+      if (tagErr) throw new Error(`goal_evidence_tags insert failed: ${tagErr.message}`);
+    }
+
+    const persistedGoals = persistedLtgs.map((ltgRow, i) => ({
+      ...ltgRow,
+      short_term_goals: persistedStgsByLtg.get(ltgRow.id) || [],
+      evidence_tags: ltgCandidates[i]?.framework_tag
+        ? [{ ltg_id: ltgRow.id, framework_name: ltgCandidates[i].framework_tag, rationale: null }]
+        : [],
+    }));
 
     return res.status(201).json({
       plan_id: planId,
-      framework_router: plan.framework_router,
-      router_confidence: plan.router_confidence,
-      reasoning_trace: plan.reasoning_trace,
-      data_sources: plan.data_sources,
-      data_gaps: plan.data_gaps ?? null,
-      goals: insertedGoals
+      reasoning_trace: null,
+      domain: v2.domain || [],
+      domain_confidence: v2.domain_confidence,
+      child_name_used: v2.child_name_used || null,
+      family_quote_held: v2.family_quote_held || null,
+      priority_chips: priorityChips,
+      data_sources: [],
+      router_confidence: v2.domain_confidence != null
+        ? String(v2.domain_confidence)
+        : null,
+      goals: persistedGoals,
+      pending_attestation: true,
+      clarifying_question: null,
     });
 
   } catch (err) {
@@ -535,6 +444,21 @@ router.post('/attest-goals', async (req, res) => {
   }
 
   await db.from('goal_plans').update({ status: 'active' }).eq('id', plan_id);
+
+  // Phase 4.0.7.23c-deploy — flip every pending_attestation LTG in this
+  // plan to 'active' so v2 candidates become live clinical goals. No
+  // attested_at/attested_by columns on long_term_goals (audit trail
+  // lives in goal_attestations.plan_snapshot above). Failure is
+  // non-fatal — plan-level attestation still recorded.
+  const { error: ltgFlipErr } = await db
+    .from('long_term_goals')
+    .update({ status: 'active' })
+    .eq('plan_id', plan_id)
+    .eq('status', 'pending_attestation');
+
+  if (ltgFlipErr) {
+    console.error('[attest-goals] LTG status flip failed:', ltgFlipErr);
+  }
 
   return res.status(201).json({
     attested: true,
