@@ -2,13 +2,23 @@ require('dotenv').config({ override: true });
 const express = require('express');
 const cors    = require('cors');
 const fetch   = require('node-fetch');
+const fs      = require('fs');
+const path    = require('path');
 const { WebSocketServer } = require('ws');
 const { Deepgram } = require('@deepgram/sdk');
+const { createClient } = require('@supabase/supabase-js');
 console.log('[boot] deepgram Deepgram type:', typeof Deepgram);
 
 const DEEPGRAM_API_KEY  = process.env.DEEPGRAM_API_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const SUPABASE_URL      = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE  = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const PORT              = process.env.PORT || 3001;
+
+// Phase 4.0.7.40-proxy-rebuild — JWT verification middleware for
+// /generate-report. Mounted per-route, not globally, so legacy
+// endpoints stay unauthenticated until each is rebuilt.
+const requireAuth = require('./middleware/requireAuth');
 
 // ── Cue Study system prompt (Phase 1) ─────────────────────────────────────────
 // Persistent multi-turn clinical reasoning thread per child. The chart context
@@ -123,7 +133,608 @@ app.use(express.json({ limit: '20mb' }));
 
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'cue-proxy' }));
 
-// ── /generate-report — narrator-aware SOAP synthesis ────────────────────────
+// ── /generate-report — Phase 4.0.7.40-proxy-rebuild ─────────────────────────
+//
+// Five structural upgrades over the legacy handler (preserved below):
+//   1. JWT verification via requireAuth (Authorization: Bearer <Supabase token>).
+//   2. Tool-use schema enforcement — one of four format-specific tools
+//      (SOAP / DAR / COAST / Narrative) is forced via tool_choice based
+//      on slp_profiles.report_format. Eliminates the JSON-as-prose
+//      parsing failure surface.
+//   3. Audit log writes to `generations` for Phase 4.1 reproducibility
+//      substrate (full prompt_system, prompt_user, request_body,
+//      response_raw, response_parsed stored per row).
+//   4. Notes-as-primary-content classification — typed-notes sessions
+//      no longer fall through to MODE D's empty-string return.
+//   5. Insufficient-content gate at the proxy layer (HTTP 422
+//      INSUFFICIENT_CONTENT before invoking Anthropic, threshold 20
+//      trimmed chars of prose if no transcript and no structured data).
+//
+// The system prompt is externalized to prompts/generate_report_v3.md
+// (loaded at module init, HTML comment header stripped — same pattern
+// as routes/generateGoals.js). Prompt is format-agnostic; per-field
+// guidance lives in each tool's input_schema descriptions.
+//
+// Response shape returns a stable {s,o,a,p} soap_note regardless of
+// the format the SLP picked. The proxy translates DAR/COAST/Narrative
+// tool outputs into {s,o,a,p} so Flutter persistence (which writes
+// `sessions.soap_note` as JSON-encoded {s,o,a,p}) needs zero changes.
+
+const GENERATE_REPORT_V3_PROMPT = fs
+  .readFileSync(path.join(__dirname, 'prompts', 'generate_report_v3.md'), 'utf8')
+  .replace(/^<!--[\s\S]*?-->\s*/, '')
+  .trim();
+
+// ── Tool definitions — one per format ──────────────────────────────────────
+// Anthropic requires `tool_choice` to name one of these; the model is
+// then constrained to call exactly that tool with the declared schema.
+// Field descriptions are the model-facing guidance; keep them tight.
+
+const TOOL_SOAP = {
+  name: 'emit_soap_note',
+  description:
+    'Emit the session note in SOAP format with a parent communication summary.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      s: {
+        type: 'string',
+        description:
+          'Subjective — caregiver / SLP report of the session and the child\'s verbal and affective behavior. Quote child speech verbatim where it appears in the source.',
+      },
+      o: {
+        type: 'string',
+        description:
+          'Objective — observable trial counts, productions, and behaviors. Use the structured data when present; quote child productions verbatim from transcript / notes.',
+      },
+      a: {
+        type: 'string',
+        description:
+          'Assessment — clinical interpretation of the observations against the active goals. Strengths-based; never pathologizing.',
+      },
+      p: {
+        type: 'string',
+        description:
+          'Plan — next-session targets and home program suggestions. Concrete, scoped to what the SLP can carry into the next contact.',
+      },
+      parent_summary: {
+        type: 'string',
+        description:
+          'Warm, jargon-free 150-300 word communication for the parent. Structure per the system prompt.',
+      },
+    },
+    required: ['s', 'o', 'a', 'p', 'parent_summary'],
+  },
+};
+
+const TOOL_DAR = {
+  name: 'emit_dar_note',
+  description:
+    'Emit the session note in DAR format (Data, Action, Response) with a parent communication summary.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      data: {
+        type: 'string',
+        description:
+          'Data — observed trial counts, child productions, behaviors. Quote verbatim where applicable.',
+      },
+      action: {
+        type: 'string',
+        description:
+          'Action — what the SLP did during the session: cues, prompts, scaffolds, activities used.',
+      },
+      response: {
+        type: 'string',
+        description:
+          'Response — how the child responded to those actions, including affect and engagement notes.',
+      },
+      parent_summary: {
+        type: 'string',
+        description:
+          'Warm, jargon-free 150-300 word communication for the parent. Structure per the system prompt.',
+      },
+    },
+    required: ['data', 'action', 'response', 'parent_summary'],
+  },
+};
+
+const TOOL_COAST = {
+  name: 'emit_coast_note',
+  description:
+    'Emit the session note in COAST format (Context, Observation, Assessment, Strategy, Target) with a parent communication summary.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      context: {
+        type: 'string',
+        description:
+          'Context — session setting, child\'s state on arrival, any relevant pre-session notes.',
+      },
+      observation: {
+        type: 'string',
+        description:
+          'Observation — what occurred during the session. Trials, productions, behaviors. Quote verbatim where applicable.',
+      },
+      assessment: {
+        type: 'string',
+        description:
+          'Assessment — clinical interpretation against active goals. Strengths-based.',
+      },
+      strategy: {
+        type: 'string',
+        description:
+          'Strategy — what worked, what didn\'t, what to carry into next session.',
+      },
+      target: {
+        type: 'string',
+        description:
+          'Target — specific next-session focus and home program suggestions.',
+      },
+      parent_summary: {
+        type: 'string',
+        description:
+          'Warm, jargon-free 150-300 word communication for the parent. Structure per the system prompt.',
+      },
+    },
+    required: ['context', 'observation', 'assessment', 'strategy', 'target', 'parent_summary'],
+  },
+};
+
+const TOOL_NARRATIVE = {
+  name: 'emit_narrative_note',
+  description:
+    'Emit the session note as a single flowing prose narrative with a parent communication summary.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      narrative: {
+        type: 'string',
+        description:
+          'Narrative — a single flowing prose record of the session integrating context, observations, interpretation, and plan in one continuous piece. Quote child productions verbatim where applicable.',
+      },
+      parent_summary: {
+        type: 'string',
+        description:
+          'Warm, jargon-free 150-300 word communication for the parent. Structure per the system prompt.',
+      },
+    },
+    required: ['narrative', 'parent_summary'],
+  },
+};
+
+const ALL_REPORT_TOOLS = [TOOL_SOAP, TOOL_DAR, TOOL_COAST, TOOL_NARRATIVE];
+const TOOL_NAME_BY_FORMAT = {
+  SOAP:      'emit_soap_note',
+  DAR:       'emit_dar_note',
+  COAST:     'emit_coast_note',
+  Narrative: 'emit_narrative_note',
+};
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+const INSUFFICIENT_CONTENT_MIN_CHARS = 20;
+
+// True when the request carries enough content to generate a non-fabricated
+// note. The 20-char floor only applies to `notes` when it is the SOLE source
+// (no transcript, no structured fields). Per founder direction 4.0.7.40.
+function isContentSufficient({ transcript, notes, structured }) {
+  const hasTranscript = (transcript || '').trim().length > 0;
+  if (hasTranscript) return true;
+
+  const structuredVals = Object.values(structured || {}).filter(
+    (v) => v !== null && v !== undefined && v !== '' && v !== 0 && v !== '0'
+  );
+  if (structuredVals.length > 0) return true;
+
+  const trimmedNotesLen = (notes || '').trim().length;
+  return trimmedNotesLen >= INSUFFICIENT_CONTENT_MIN_CHARS;
+}
+
+// Classifies the input source for audit/logging only. The LLM does not
+// branch on this string; the system prompt + tool schemas drive its
+// behavior.
+function detectMode({ transcript, notes, structured }) {
+  const hasTranscript = (transcript || '').trim().length > 0;
+  const hasNotes      = (notes || '').trim().length > 0;
+  const structuredVals = Object.values(structured || {}).filter(
+    (v) => v !== null && v !== undefined && v !== '' && v !== 0 && v !== '0'
+  );
+  const hasStructured = structuredVals.length > 0;
+
+  const sources = [];
+  if (hasTranscript) sources.push('TRANSCRIPT');
+  if (hasNotes)      sources.push('PROSE');
+  if (hasStructured) sources.push('STRUCTURED');
+
+  if (sources.length === 0) return 'EMPTY';
+  if (sources.length === 1) return sources[0];
+  return 'MIXED';
+}
+
+// Builds the user message Claude sees. Order is intentional: client
+// identity first, active goals next (to anchor the assessment), then
+// each populated source block. Empty blocks are omitted entirely so
+// the model never sees "(no transcript)" placeholders that bias mode
+// detection (the legacy prompt's failure mode).
+function buildUserMessage({ clientName, transcript, notes, structured, goals, clientMeta }) {
+  const blocks = [];
+
+  const idLines = [`Name: ${clientName || 'Unknown'}`];
+  if (clientMeta && (clientMeta.age_years != null || clientMeta.age_months != null)) {
+    const y = clientMeta.age_years ?? '?';
+    const m = clientMeta.age_months ?? '?';
+    idLines.push(`Age: ${y}y ${m}m`);
+  }
+  if (clientMeta && clientMeta.language) {
+    idLines.push(`Therapy language: ${clientMeta.language}`);
+  }
+  blocks.push(`## CLIENT\n${idLines.join('\n')}`);
+
+  if (Array.isArray(goals) && goals.length > 0) {
+    const goalLines = goals
+      .map((g) => {
+        const dom = g.domain || 'goal';
+        const gt  = g.goal_text || g.goal || '';
+        const tg  = g.target_accuracy ?? g.target ?? null;
+        const tgStr = tg != null ? ` (target: ${tg}%)` : '';
+        return `- [${dom}] ${gt}${tgStr}`;
+      })
+      .join('\n');
+    blocks.push(`## ACTIVE GOALS\n${goalLines}`);
+  }
+
+  const t = (transcript || '').trim();
+  if (t.length > 0) {
+    blocks.push(`## TRANSCRIPT (SLP's verbal narration)\n${t}`);
+  }
+
+  const n = (notes || '').trim();
+  if (n.length > 0) {
+    blocks.push(`## SESSION NOTE (SLP's typed prose record)\n${n}`);
+  }
+
+  const structuredFmt = formatStructuredBlock(structured);
+  if (structuredFmt) {
+    blocks.push(`## STRUCTURED DATA\n${structuredFmt}`);
+  }
+
+  return blocks.join('\n\n');
+}
+
+function formatStructuredBlock(structured) {
+  if (!structured || typeof structured !== 'object') return null;
+  const labels = {
+    date:                  'Session date',
+    target_behaviour:      'Target behavior',
+    activity_name:         'Activity',
+    attempts:              'Trials attempted',
+    independent_responses: 'Independent responses',
+    prompted_responses:    'Prompted responses',
+    goal_met:              'Goal met',
+    client_affect:         'Client affect',
+  };
+  const lines = [];
+  for (const [key, label] of Object.entries(labels)) {
+    const v = structured[key];
+    if (v === null || v === undefined || v === '' || v === 0 || v === '0') continue;
+    lines.push(`${label}: ${v}`);
+  }
+  return lines.length > 0 ? lines.join('\n') : null;
+}
+
+// Translates a tool's structured output into the stable {s,o,a,p,
+// parent_summary} shape Flutter persistence already understands.
+// This is the format-bridge: the SLP picked DAR/COAST/Narrative,
+// the model called the matching tool, but the DB row keys remain
+// {s,o,a,p} so `sessions.soap_note`'s JSON shape never changes.
+function translateToolOutput(format, toolInput) {
+  const ps = toolInput.parent_summary || '';
+  switch (format) {
+    case 'DAR':
+      return {
+        s: toolInput.data     || '',
+        o: toolInput.action   || '',
+        a: toolInput.response || '',
+        p: '',
+        parent_summary: ps,
+      };
+    case 'COAST': {
+      const strategy = (toolInput.strategy || '').trim();
+      const target   = (toolInput.target   || '').trim();
+      const pParts = [];
+      if (strategy) pParts.push(`Strategy: ${strategy}`);
+      if (target)   pParts.push(`Target: ${target}`);
+      return {
+        s: toolInput.context     || '',
+        o: toolInput.observation || '',
+        a: toolInput.assessment  || '',
+        p: pParts.join('\n\n'),
+        parent_summary: ps,
+      };
+    }
+    case 'Narrative':
+      return {
+        s: toolInput.narrative || '',
+        o: '',
+        a: '',
+        p: '',
+        parent_summary: ps,
+      };
+    case 'SOAP':
+    default:
+      return {
+        s: toolInput.s || '',
+        o: toolInput.o || '',
+        a: toolInput.a || '',
+        p: toolInput.p || '',
+        parent_summary: ps,
+      };
+  }
+}
+
+// Synchronous insert into `generations`. Returns the new row's id on
+// success, null on any failure. Failures are logged but do NOT block
+// the response — the SLP's report ships even if logging breaks. Phase
+// 4.1 reconciliation can re-derive missed rows from Render logs.
+async function writeAuditRow(db, row) {
+  try {
+    const { data, error } = await db
+      .from('generations')
+      .insert(row)
+      .select('id')
+      .single();
+    if (error) {
+      console.error('[generate-report] audit insert error:', error.message);
+      return null;
+    }
+    return (data && data.id) || null;
+  } catch (e) {
+    console.error('[generate-report] audit insert exception:', e.message);
+    return null;
+  }
+}
+
+app.post('/generate-report', requireAuth, async (req, res) => {
+  const startedAt    = Date.now();
+  const requestBytes = JSON.stringify(req.body || {}).length;
+  const db           = createClient(SUPABASE_URL, SUPABASE_SERVICE);
+  const clinicianId  = req.user.id;
+
+  const {
+    session_id,
+    client_id,
+    client_name,
+    report_format,
+    transcript,
+    notes,
+    structured,
+    goals,
+    client_meta,
+  } = req.body || {};
+
+  // ── Validate
+  if (!session_id || !client_id) {
+    const missing = !session_id ? 'session_id' : 'client_id';
+    await writeAuditRow(db, {
+      clinician_id:    clinicianId,
+      session_id:      session_id || null,
+      client_id:       client_id  || null,
+      endpoint:        'generate-report',
+      format:          report_format || null,
+      mode:            null,
+      prompt_system:   null,
+      prompt_user:     null,
+      request_body:    req.body || {},
+      response_raw:    null,
+      response_parsed: null,
+      model:           null,
+      input_tokens:    null,
+      output_tokens:   null,
+      duration_ms:     Date.now() - startedAt,
+      request_bytes:   requestBytes,
+      status:          'validation_error',
+      error_message:   `${missing} is required`,
+      warnings:        null,
+    });
+    return res.status(400).json({ error: `${missing} is required`, field: missing });
+  }
+
+  // ── Sufficient-content gate
+  if (!isContentSufficient({ transcript, notes, structured })) {
+    await writeAuditRow(db, {
+      clinician_id:    clinicianId,
+      session_id, client_id,
+      endpoint:        'generate-report',
+      format:          report_format || null,
+      mode:            'EMPTY',
+      prompt_system:   null,
+      prompt_user:     null,
+      request_body:    req.body,
+      response_raw:    null,
+      response_parsed: null,
+      model:           null,
+      input_tokens:    null,
+      output_tokens:   null,
+      duration_ms:     Date.now() - startedAt,
+      request_bytes:   requestBytes,
+      status:          'insufficient_content',
+      error_message:   null,
+      warnings:        null,
+    });
+    return res.status(422).json({
+      error:
+        'Insufficient session data — record at least 20 characters of prose, a transcript, or structured trial data.',
+      code: 'INSUFFICIENT_CONTENT',
+    });
+  }
+
+  // ── Resolve format → tool
+  const fmt = TOOL_NAME_BY_FORMAT[report_format] ? report_format : 'SOAP';
+  const toolName    = TOOL_NAME_BY_FORMAT[fmt];
+  const mode        = detectMode({ transcript, notes, structured });
+  const userMessage = buildUserMessage({
+    clientName:  client_name,
+    transcript, notes, structured, goals,
+    clientMeta:  client_meta,
+  });
+
+  console.log(
+    `[generate-report] clinician=${clinicianId.slice(0, 8)} ` +
+    `session=${session_id} format=${fmt} mode=${mode} ` +
+    `transcript_len=${(transcript || '').length} ` +
+    `notes_len=${(notes || '').length}`
+  );
+
+  // ── Anthropic call
+  let upstream;
+  let anthropicData;
+  try {
+    upstream = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model:       'claude-opus-4-5',
+        max_tokens:  2048,
+        system:      GENERATE_REPORT_V3_PROMPT,
+        tools:       ALL_REPORT_TOOLS,
+        tool_choice: { type: 'tool', name: toolName },
+        messages:    [{ role: 'user', content: userMessage }],
+      }),
+    });
+    anthropicData = await upstream.json();
+  } catch (e) {
+    await writeAuditRow(db, {
+      clinician_id:    clinicianId,
+      session_id, client_id,
+      endpoint:        'generate-report',
+      format:          fmt,
+      mode,
+      prompt_system:   GENERATE_REPORT_V3_PROMPT,
+      prompt_user:     userMessage,
+      request_body:    req.body,
+      response_raw:    null,
+      response_parsed: null,
+      model:           'claude-opus-4-5',
+      input_tokens:    null,
+      output_tokens:   null,
+      duration_ms:     Date.now() - startedAt,
+      request_bytes:   requestBytes,
+      status:          'upstream_error',
+      error_message:   `Anthropic fetch failed: ${e.message}`,
+      warnings:        null,
+    });
+    return res.status(502).json({ error: `Anthropic upstream failure: ${e.message}` });
+  }
+
+  if (!upstream.ok) {
+    await writeAuditRow(db, {
+      clinician_id:    clinicianId,
+      session_id, client_id,
+      endpoint:        'generate-report',
+      format:          fmt,
+      mode,
+      prompt_system:   GENERATE_REPORT_V3_PROMPT,
+      prompt_user:     userMessage,
+      request_body:    req.body,
+      response_raw:    anthropicData,
+      response_parsed: null,
+      model:           'claude-opus-4-5',
+      input_tokens:    anthropicData?.usage?.input_tokens  || null,
+      output_tokens:   anthropicData?.usage?.output_tokens || null,
+      duration_ms:     Date.now() - startedAt,
+      request_bytes:   requestBytes,
+      status:          'upstream_error',
+      error_message:   anthropicData?.error?.message || `HTTP ${upstream.status}`,
+      warnings:        null,
+    });
+    return res.status(upstream.status).json(anthropicData);
+  }
+
+  // ── Extract tool output
+  const blocks = Array.isArray(anthropicData.content) ? anthropicData.content : [];
+  const toolUseBlock = blocks.find((b) => b && b.type === 'tool_use' && b.name === toolName);
+
+  if (!toolUseBlock || !toolUseBlock.input) {
+    await writeAuditRow(db, {
+      clinician_id:    clinicianId,
+      session_id, client_id,
+      endpoint:        'generate-report',
+      format:          fmt,
+      mode,
+      prompt_system:   GENERATE_REPORT_V3_PROMPT,
+      prompt_user:     userMessage,
+      request_body:    req.body,
+      response_raw:    anthropicData,
+      response_parsed: null,
+      model:           'claude-opus-4-5',
+      input_tokens:    anthropicData?.usage?.input_tokens  || null,
+      output_tokens:   anthropicData?.usage?.output_tokens || null,
+      duration_ms:     Date.now() - startedAt,
+      request_bytes:   requestBytes,
+      status:          'upstream_error',
+      error_message:   `Model did not call expected tool (${toolName}); stop_reason=${anthropicData.stop_reason || 'unknown'}`,
+      warnings:        null,
+    });
+    return res.status(502).json({
+      error: 'Model did not produce a tool_use response.',
+      stop_reason: anthropicData.stop_reason || null,
+    });
+  }
+
+  // ── Translate to {s,o,a,p,parent_summary}
+  const translated = translateToolOutput(fmt, toolUseBlock.input);
+
+  // ── Audit success (synchronous, non-blocking on failure)
+  const generationId = await writeAuditRow(db, {
+    clinician_id:    clinicianId,
+    session_id, client_id,
+    endpoint:        'generate-report',
+    format:          fmt,
+    mode,
+    prompt_system:   GENERATE_REPORT_V3_PROMPT,
+    prompt_user:     userMessage,
+    request_body:    req.body,
+    response_raw:    anthropicData,
+    response_parsed: translated,
+    model:           'claude-opus-4-5',
+    input_tokens:    anthropicData?.usage?.input_tokens  || null,
+    output_tokens:   anthropicData?.usage?.output_tokens || null,
+    duration_ms:     Date.now() - startedAt,
+    request_bytes:   requestBytes,
+    status:          'success',
+    error_message:   null,
+    warnings:        null,
+  });
+
+  return res.json({
+    format: fmt,
+    mode,
+    soap_note: {
+      s: translated.s,
+      o: translated.o,
+      a: translated.a,
+      p: translated.p,
+    },
+    parent_summary: translated.parent_summary,
+    generation_id:  generationId,
+    warnings:       [],
+  });
+});
+
+// ── /generate-report-legacy — pre-rebuild handler ──────────────────────────
+//
+// Phase 4.0.7.40-proxy-rebuild renamed the original /generate-report
+// path to /generate-report-legacy and stood up a tool-use-driven
+// successor (see /generate-report above). This block is preserved
+// VERBATIM from 4.0.7.9i-fix1 (commit 0135a65) so that flipping the
+// Flutter `_proxyUrl` constant to /generate-report-legacy is a clean
+// rollback. Sunset target: one week after 4.0.7.40 deploys cleanly,
+// in a follow-up phase.
 //
 // Phase 4.0.7.9i — four modes:
 //   A: narrator-only  (transcript present, structured fields empty/missing)
@@ -186,7 +797,7 @@ PARENT_SUMMARY GENERATION:
 - When quoting child speech, preserve native script and quotation marks exactly.
 - Sign-off: "Remember: every session builds on the last. Your involvement at home makes a significant difference in your child's progress."`;
 
-app.post('/generate-report', async (req, res) => {
+app.post('/generate-report-legacy', async (req, res) => {
   try {
     const { clientName, session, additionalContext, goals } = req.body;
 
