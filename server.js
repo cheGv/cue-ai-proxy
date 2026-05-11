@@ -20,6 +20,9 @@ const PORT              = process.env.PORT || 3001;
 // endpoints stay unauthenticated until each is rebuilt.
 const requireAuth = require('./middleware/requireAuth');
 
+// ── Cue Reasoning system prompt (separate file — kept raw for readability) ────
+const { CUE_REASONING_SYSTEM_PROMPT } = require('./prompts/cueReasoning');
+
 // ── Cue Study system prompt (Phase 1) ─────────────────────────────────────────
 // Persistent multi-turn clinical reasoning thread per child. The chart context
 // is appended to this prompt as an additional system block on every request.
@@ -1108,6 +1111,136 @@ app.post('/cue-study', async (req, res) => {
     console.error('[/cue-study] error — message:', err.message);
     console.error('[/cue-study] error — stack:',   err.stack);
     res.status(500).json({ error: 'Cue Study request failed' });
+  }
+});
+
+// ── /cue-reasoning — Ask Cue · {client_name} chat surface ─────────────────────
+// Body: { client_id, message, conversation_history }
+//   conversation_history: [{role: 'user'|'assistant', content: string}, ...]
+// Auth: Authorization: Bearer <supabase-jwt> — `req.user.id` (set by
+//   requireAuth) is the clinician_id used for both the ownership check
+//   and the slp_profiles.response_style lookup. The Flutter client must
+//   NOT send slp_id in the body; identity comes from the JWT.
+// Returns: full Anthropic non-streaming response (the client extracts content[0].text).
+//
+// The prompt placeholders {client_name}, {age}, {diagnosis},
+// {user_style_preference}, {session_context} are filled here via plain
+// string replacement against CUE_REASONING_SYSTEM_PROMPT. The clients
+// lookup is a single combined ownership-and-fetch query — if the
+// authenticated SLP does not own client_id, the route 403s before any
+// defaults are applied and before the Anthropic call is made.
+//
+// TODO(flutter-client): the Flutter client must send
+// { client_id, message, conversation_history } to this endpoint with
+// the Supabase auth JWT on the Authorization header.
+app.post('/cue-reasoning', requireAuth, async (req, res) => {
+  try {
+    const {
+      client_id,
+      message,
+      conversation_history,
+    } = req.body || {};
+
+    if (typeof message !== 'string' || message.trim() === '') {
+      return res.status(400).json({ error: 'message (string) is required' });
+    }
+    if (!client_id) {
+      return res.status(400).json({ error: 'client_id is required' });
+    }
+
+    const slpId = req.user.id;
+    const db    = createClient(SUPABASE_URL, SUPABASE_SERVICE);
+
+    // ── Ownership-and-fetch: one query, two outcomes ─────────────────────────
+    // Row returned → authenticated SLP owns this client; use the data.
+    // No row     → 403 before any defaulting and before the Anthropic call.
+    const { data: clientRow, error: clientErr } = await db
+      .from('clients')
+      .select('name, age, diagnosis')
+      .eq('id', client_id)
+      .eq('clinician_id', slpId)
+      .maybeSingle();
+
+    if (clientErr) {
+      console.error('[/cue-reasoning] client lookup error — client_id:', client_id,
+        '| slp_id:', slpId, '| error:', clientErr.message);
+      return res.status(500).json({ error: 'Client lookup failed' });
+    }
+    if (!clientRow) {
+      console.warn('[/cue-reasoning] ownership check failed — client_id:', client_id,
+        '| slp_id:', slpId);
+      return res.status(403).json({ error: 'Client not found or access denied' });
+    }
+
+    const clientName = clientRow.name      || 'this client';
+    const clientAge  = clientRow.age != null ? String(clientRow.age) : 'unknown';
+    const diagnosis  = clientRow.diagnosis || 'unknown';
+
+    // ── Resolve SLP style preference ─────────────────────────────────────────
+    // slp_profiles.response_style is a forthcoming column — fall back to
+    // 'balanced' if the column doesn't exist yet or the row is missing.
+    // See NEXT_STEPS.md for the migration to add this column.
+    let stylePreference = 'balanced';
+    const { data: slpRow, error: slpErr } = await db
+      .from('slp_profiles')
+      .select('response_style')
+      .eq('clinician_id', slpId)
+      .maybeSingle();
+    if (slpErr) {
+      // Most likely cause: column doesn't exist yet. Keep default.
+      console.warn('[/cue-reasoning] slp_profiles.response_style lookup failed — slp_id:',
+        slpId, '| error:', slpErr.message);
+    } else if (slpRow && slpRow.response_style) {
+      stylePreference = slpRow.response_style;
+    }
+
+    // TODO: wire session-notes RAG when retrieval pipeline is built
+    const sessionContext = '';
+
+    // ── Build the final system prompt via plain string replacement ───────────
+    const systemMessage = CUE_REASONING_SYSTEM_PROMPT
+      .replaceAll('{client_name}',           clientName)
+      .replaceAll('{age}',                   clientAge)
+      .replaceAll('{diagnosis}',             diagnosis)
+      .replaceAll('{user_style_preference}', stylePreference)
+      .replaceAll('{session_context}',       sessionContext);
+
+    // ── Build messages array: prior history (if any) + current turn ──────────
+    const history = Array.isArray(conversation_history) ? conversation_history : [];
+    const messages = [
+      ...history.map((m) => ({ role: m.role, content: m.content })),
+      { role: 'user', content: message },
+    ];
+
+    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model:      'claude-sonnet-4-20250514',
+        max_tokens: 2000,
+        system:     systemMessage,
+        messages,
+      }),
+    });
+
+    const data = await upstream.json();
+    if (!upstream.ok) {
+      console.error('[/cue-reasoning] Anthropic API error — status:', upstream.status,
+        '| type:',    data?.error?.type,
+        '| message:', data?.error?.message);
+      return res.status(upstream.status).json({
+        error: data?.error?.message || 'Anthropic API error',
+      });
+    }
+    res.json(data);
+  } catch (err) {
+    console.error('[/cue-reasoning] error — message:', err.message);
+    console.error('[/cue-reasoning] error — stack:',   err.stack);
+    res.status(500).json({ error: 'Cue Reasoning request failed' });
   }
 });
 
