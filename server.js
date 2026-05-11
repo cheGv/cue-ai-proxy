@@ -1133,13 +1133,44 @@ app.post('/cue-study', async (req, res) => {
 // TODO(flutter-client): the Flutter client must send
 // { client_id, message, conversation_history } to this endpoint with
 // the Supabase auth JWT on the Authorization header.
+
+// Cue Reasoning — Today-screen / session-flow clinical AI surface
+// Request contract: see NEXT_STEPS.md §2.1 for canonical payload shape, status codes, and Flutter integration notes.
+// Distinct from the reasoning_threads goal-authoring system (Phase 4.0.7.20) which persists multi-turn threads.
 app.post('/cue-reasoning', requireAuth, async (req, res) => {
   try {
+    const body = req.body || {};
+
+    // ── Request-size guard ────────────────────────────────────────────────────
+    // Global express.json limit is 20mb (server.js top). Cap this route at
+    // 32 KB — comfortably fits a 20-turn conversation_history, tight enough
+    // to flag abuse before any DB or Anthropic round-trip.
+    const bodyBytes = Buffer.byteLength(JSON.stringify(body), 'utf8');
+    if (bodyBytes > 32768) {
+      console.warn('[/cue-reasoning] payload too large — bytes:', bodyBytes,
+        '| slp_id:', req.user.id);
+      return res.status(413).json({
+        error: 'Payload Too Large — /cue-reasoning body is capped at 32 KB',
+      });
+    }
+
+    // ── Reject stray slp_id from stale clients ───────────────────────────────
+    // slp_id is derived server-side from req.user.id; clients sending it in
+    // the body are running outdated code. Fail fast, identify in logs.
+    if (Object.prototype.hasOwnProperty.call(body, 'slp_id')) {
+      console.warn('[/cue-reasoning] stale client sent slp_id — body.slp_id:',
+        body.slp_id, '| req.user.id:', req.user.id,
+        '| user-agent:', req.headers['user-agent']);
+      return res.status(400).json({
+        error: 'slp_id is no longer accepted in request body; it is derived from the authenticated session. Update your client to remove this field.',
+      });
+    }
+
     const {
       client_id,
       message,
       conversation_history,
-    } = req.body || {};
+    } = body;
 
     if (typeof message !== 'string' || message.trim() === '') {
       return res.status(400).json({ error: 'message (string) is required' });
