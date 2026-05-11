@@ -58,6 +58,43 @@ If the Flutter client is still sending the old `/cue-study` shape
 above when migrating off `/cue-study`. The legacy `/cue-study` endpoint
 is left in place and untouched.
 
+## 2.1 — /cue-reasoning request contract (canonical)
+
+```
+POST https://cue-ai-proxy.onrender.com/cue-reasoning
+Authorization: Bearer <supabase access token>
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{
+  "client_id":            "<clients.id uuid>",
+  "message":              "<latest user turn>",
+  "conversation_history": [{ "role": "user|assistant", "content": "..." }]
+}
+```
+
+Status codes returned by handler:
+
+- `400` — missing `message` or `client_id` in body
+- `401` — missing/invalid JWT (from `requireAuth` middleware)
+- `403` — `Client not found or access denied` (ownership check failed —
+  SLP does not own this `client_id`)
+- `500` — `Client lookup failed` (DB error) **or** `Cue Reasoning request
+  failed` (internal error)
+- Upstream Anthropic status passed through on Anthropic API errors
+
+Notes for Flutter integration:
+
+- `slp_id` is NEVER sent in body; derived server-side from `req.user.id`
+  via `requireAuth`.
+- JWT obtained via
+  `Supabase.instance.client.auth.currentSession?.accessToken`.
+- `conversation_history` is optional; defaults to empty array if omitted.
+- `message` and `client_id` are required.
+
 ## 3. Session-notes RAG
 
 The `{session_context}` placeholder in the Cue Reasoning prompt is
