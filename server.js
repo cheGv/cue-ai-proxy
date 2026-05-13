@@ -1431,6 +1431,438 @@ app.post('/generate-brief', async (req, res) => {
   }
 });
 
+// ── /cue-domain-detect — domain attribute classifier (v1.3.1) ─────────────────
+// Body: { client_id, diagnosis?, assessment_text?, intake_notes?, ltg_text?,
+//         stg_text?, trigger_source }
+// Auth: Authorization: Bearer <supabase-jwt> — `req.user.id` (set by
+//   requireAuth) is the slp_user_id used for both the ownership check
+//   and the audit row. The Flutter client must NOT send slp_user_id in
+//   the body; identity comes from the JWT (mirrors /cue-reasoning).
+// Returns: { primary_domain, secondary_domains, confidence, reasoning,
+//            persisted, reason? }
+//
+// Spec: v1.3.1 build brief.
+// CLAUDE.md §10 invariants enforced here:
+//   - primary_domain NULL IFF confidence 0.0 (validated below)
+//   - Detection failures (technical) → detection_failure_log
+//   - Insufficient input (word-count gate or model-judged) → detection_insufficient_input_log
+//   - Auto-detection history rows insert from app layer (auth.uid() is null in this server-side context)
+//   - SLP-authoritative clients are skipped (defense in depth; client-side guard is first line)
+//
+// Deviation from v1.3.1 Task 2 spec text (D5 approved): model identifier
+// is 'claude-opus-4-5' rather than 'claude-opus-4-7' — matches the
+// existing proxy convention and is the verified-working identifier.
+// Spec text to be updated in v1.3.2.
+
+const { createHash } = require('crypto');
+
+const DOMAIN_DETECTOR_VERSION = 'v1';
+
+const CUE_DOMAIN_DETECT_SYSTEM_PROMPT = `You are a domain classifier for an Indian SLP clinical OS called Cue. Your only job is to identify which clinical SLP domain best characterizes the client's presenting case, based on the diagnosis, assessment notes, and goals provided.
+
+The domain controlled vocabulary, with definitions:
+
+- dysphagia: Swallowing disorders. Look for keywords like aspiration, IDDSI, bolus, swallow, oral intake, feeding tube, VFSS, FEES, dysphagia, stroke with feeding involvement, esophageal, oropharyngeal. Adult stroke cases with feeding involvement, pediatric feeding disorders, post-surgical swallowing intervention.
+
+- aac: Augmentative and alternative communication. Look for keywords like AAC, PECS, core board, communication device, non-speaking, minimally verbal, symbol, picture exchange, communicative functions, modeling. Children or adults whose primary intervention is supporting communication via non-speech or supplementary modalities.
+
+- motor_speech: Disorders of speech production due to motor planning or motor execution deficits. Look for keywords like apraxia, CAS, dysarthria, PROMPT, oral motor, articulation linked to motor planning, phoneme inventory in context of motor difficulty. Distinguish from articulation disorders without motor basis (those are 'language').
+
+- language: Receptive and expressive language disorders without motor or AAC primary basis. Look for keywords like language delay, late talker, MLU, vocabulary, syntax, semantic, pragmatic, DLD, specific language impairment. Articulation/phonology cases not driven by motor planning belong here.
+
+- fluency: Stuttering, cluttering, fluency disorders. Look for keywords like stuttering, cluttering, fluency, disfluency, blocks, repetitions, prolongations, secondary behaviors, Lidcombe, RESTART, stuttering modification.
+
+- voice: Voice disorders. Look for keywords like vocal cord, paralysis, nodules, voice quality, hoarseness, dysphonia, vocal hygiene, MTD, RVT, LSVT, laryngectomy. Both organic and functional voice cases.
+
+- aphasia: Acquired language disorders, typically post-stroke or post-TBI in adults. Look for keywords like aphasia, Broca, Wernicke, anomia, post-stroke language, naming, agrammatism, CILT, semantic feature analysis.
+
+- asd_regulatory: ASD intervention with regulatory and pre-linguistic focus. Look for keywords like co-regulation, transitions, sensory regulation, joint attention, communicative intent, NDBI, ImPACT, EMT, restricted interests. Used when the primary intervention target is regulatory and pre-linguistic foundation, not specific language or AAC goals.
+
+- cognitive_communication: Communication disorders arising from cognitive deficits in attention, memory, executive function, social cognition, or awareness — rather than from primary language, motor, or voice impairment. Look for keywords like right-hemisphere damage, TBI, dementia, executive dysfunction, social cognition, pragmatic deficits secondary to cognitive impairment, attention-based communication breakdowns, MCI, frontal/temporal involvement, post-COVID cognitive fog. Distinguish from aphasia (primary language) and from primary pragmatic language disorder in developmental cases (those are language).
+
+Important classification constraints:
+
+1. A diagnosis of 'autism' or 'ASD' alone is not sufficient to assign asd_regulatory. Many autistic clients are primarily AAC, language, or motor speech cases. Look at the goals and assessment content, not the diagnostic label.
+
+2. Adult stroke does not automatically mean dysphagia or aphasia. Check the intervention focus. If the goals are swallowing-focused, it's dysphagia. If language-focused, it's aphasia. If cognitive-communication focused (right-hemisphere, executive), it's cognitive_communication. Multiple domains can coexist as primary + secondary.
+
+3. Pediatric feeding without aspiration risk concerns is still dysphagia if bolus management and consistencies are the intervention target.
+
+secondary_domains rules:
+
+- Populate only when goals or assessment evidence explicitly indicate active intervention targets in a second domain. Do not populate based on diagnosis alone — a child with autism and a language goal is primary 'language', not primary 'language' + secondary 'asd_regulatory', unless the regulatory work is itself a documented intervention target.
+
+- Maximum two secondary domains. Three or more indicates the case shape is unclear and should be flagged with confidence < 0.6 and reasoning that names the ambiguity.
+
+- Order in the array is by clinical weight — secondary_domains[0] is the more clinically active of the secondaries. Never alphabetical, never arbitrary.
+
+- If no secondary domain meets the bar, return an empty array. Do not hallucinate secondaries to seem comprehensive.
+
+Language handling:
+
+- Input may be in English, Hindi, Telugu, Tamil, Kannada, or English-Indian language hybrid (code-mixed). Process the case in whatever language it is presented. Return the JSON in English regardless of input language.
+
+- If a clinical term appears only in a regional language and you are uncertain of its meaning, reflect that uncertainty in confidence (lower) and reasoning (note the term). Do not guess at translations of specific clinical terminology.
+
+Insufficient input handling:
+
+- If the provided input is insufficient to make any meaningful classification (fewer than 5 substantive clinical words across all fields, or input is placeholder text like "TBD" or "to be assessed" or "name only"), return:
+
+  {
+    "primary_domain": null,
+    "secondary_domains": [],
+    "confidence": 0.0,
+    "reasoning": "Insufficient clinical detail for classification."
+  }
+
+  CRITICAL INVARIANT: primary_domain is null IFF confidence is 0.0. Both must hold together or neither. Never return null primary_domain with non-zero confidence. Never return non-null primary_domain with confidence 0.0. The application layer will reject responses violating this invariant.
+
+Return your assessment in this exact JSON shape, nothing else:
+
+{
+  "primary_domain": "<domain_enum>" or null,
+  "secondary_domains": ["<domain_enum>", ...],
+  "confidence": <float 0.0-1.0>,
+  "reasoning": "<one sentence, hard maximum 200 characters>"
+}
+
+Field rules:
+
+- primary_domain: Must be exactly one of the nine enum values, OR null when confidence is exactly 0.0.
+
+- secondary_domains: Array of zero, one, or two domain enums. Empty array if none warranted, or when primary_domain is null.
+
+- confidence: Float between 0.0 and 1.0. 0.0 means insufficient input (paired with null primary). Below 0.75 surfaces to the SLP as a question rather than an applied fact. Be honest about uncertainty — a 0.6 confidence detection the SLP corrects is better data than a falsely confident 0.9 that misses the case shape.
+
+- reasoning: One sentence, maximum 200 characters. Reference the specific evidence from the input that drove the classification. No interpretation beyond category assignment. No recommendations. No clinical opinions. This text appears in the SLP's audit log.`;
+
+const DOMAIN_DETECTOR_PROMPT_HASH = createHash('sha256')
+  .update(CUE_DOMAIN_DETECT_SYSTEM_PROMPT)
+  .digest('hex')
+  .substring(0, 8);
+
+const VALID_CLINICAL_DOMAINS = [
+  'dysphagia', 'aac', 'motor_speech', 'language',
+  'fluency', 'voice', 'aphasia', 'asd_regulatory', 'cognitive_communication',
+];
+
+const VALID_DOMAIN_TRIGGER_SOURCES = [
+  'auto_intake', 'auto_assessment_upload', 'auto_session_emergent',
+];
+
+// Word-count gate: cost-control filter to skip detector calls when input is
+// definitely too thin to classify. NOT a quality gate — the detector handles
+// quality via the confidence-0.0/null-primary sentinel. Do not raise this
+// threshold without understanding both purposes are in play.
+const DOMAIN_DETECT_MIN_INPUT_WORDS = 3;
+
+// Payload-size guard. Detector input is bounded (~4 KB max for diagnosis +
+// assessment + LTG + STG + intake notes combined). Anything larger is
+// abuse or a stale client — flag before any DB or Anthropic round-trip.
+const DOMAIN_DETECT_MAX_BYTES = 4096;
+
+app.post('/cue-domain-detect', requireAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+
+    // ── Request-size guard ────────────────────────────────────────────────────
+    const bodyBytes = Buffer.byteLength(JSON.stringify(body), 'utf8');
+    if (bodyBytes > DOMAIN_DETECT_MAX_BYTES) {
+      console.warn('[/cue-domain-detect] payload too large — bytes:', bodyBytes,
+        '| slp_id:', req.user.id);
+      return res.status(413).json({
+        error: `Payload Too Large — /cue-domain-detect body is capped at ${DOMAIN_DETECT_MAX_BYTES} bytes`,
+      });
+    }
+
+    // ── Reject stray slp_user_id from clients ─────────────────────────────────
+    // slp_user_id is derived server-side from req.user.id; clients sending
+    // it in the body are running outdated code. Fail fast, identify in logs.
+    if (Object.prototype.hasOwnProperty.call(body, 'slp_user_id')) {
+      console.warn('[/cue-domain-detect] stale client sent slp_user_id — body.slp_user_id:',
+        body.slp_user_id, '| req.user.id:', req.user.id,
+        '| user-agent:', req.headers['user-agent']);
+      return res.status(400).json({
+        error: 'slp_user_id is not accepted in request body; it is derived from the authenticated session. Update your client to remove this field.',
+      });
+    }
+
+    const {
+      client_id,
+      diagnosis,
+      assessment_text,
+      intake_notes,
+      ltg_text,
+      stg_text,
+      trigger_source,
+    } = body;
+
+    if (!client_id) {
+      return res.status(400).json({ error: 'client_id is required' });
+    }
+    if (!trigger_source) {
+      return res.status(400).json({ error: 'trigger_source is required' });
+    }
+    if (!VALID_DOMAIN_TRIGGER_SOURCES.includes(trigger_source)) {
+      return res.status(400).json({ error: `invalid trigger_source: ${trigger_source}` });
+    }
+
+    const slpId = req.user.id;
+    const db    = createClient(SUPABASE_URL, SUPABASE_SERVICE);
+
+    // ── Ownership-and-fetch: one query, two outcomes ─────────────────────────
+    // Row returned → authenticated SLP owns this client; use the data.
+    // No row     → 403 before any work and before the Anthropic call.
+    const { data: clientRow, error: clientErr } = await db
+      .from('clients')
+      .select('primary_domain, secondary_domains, domain_detection_confidence, is_slp_authoritative')
+      .eq('id', client_id)
+      .eq('clinician_id', slpId)
+      .maybeSingle();
+
+    if (clientErr) {
+      console.error('[/cue-domain-detect] client lookup error — client_id:', client_id,
+        '| slp_id:', slpId, '| error:', clientErr.message);
+      return res.status(500).json({ error: 'Client lookup failed' });
+    }
+    if (!clientRow) {
+      console.warn('[/cue-domain-detect] ownership check failed — client_id:', client_id,
+        '| slp_id:', slpId);
+      return res.status(403).json({ error: 'Client not found or access denied' });
+    }
+
+    // ── Build user message
+    const contextBlocks = [];
+    if (diagnosis)       contextBlocks.push(`DIAGNOSIS:\n${diagnosis}`);
+    if (assessment_text) contextBlocks.push(`ASSESSMENT NOTES:\n${assessment_text}`);
+    if (intake_notes)    contextBlocks.push(`INTAKE NOTES:\n${intake_notes}`);
+    if (ltg_text)        contextBlocks.push(`LONG-TERM GOAL:\n${ltg_text}`);
+    if (stg_text)        contextBlocks.push(`SHORT-TERM GOAL:\n${stg_text}`);
+
+    const userMessage = contextBlocks.join('\n\n') || 'No case detail provided.';
+    const wordCount = userMessage.split(/\s+/).filter(Boolean).length;
+
+    // ── Word-count gate before spending API call.
+    // Logged to detection_insufficient_input_log (NOT detection_failure_log) —
+    // this is a legitimate "too thin" signal, not a technical failure.
+    if (wordCount < DOMAIN_DETECT_MIN_INPUT_WORDS) {
+      await db.from('detection_insufficient_input_log').insert({
+        client_id,
+        source: 'word_count_gate',
+        attempted_trigger_source: trigger_source,
+        detector_version: DOMAIN_DETECTOR_VERSION,
+        input_word_count: wordCount,
+      });
+      return res.json({
+        primary_domain: null,
+        secondary_domains: [],
+        confidence: 0.0,
+        reasoning: 'Input below minimum word threshold.',
+        persisted: false,
+        reason: 'below_word_threshold',
+      });
+    }
+
+    // ── Anthropic call with retry (max 2 attempts)
+    let parsed;
+    let attempt = 0;
+    const maxAttempts = 2;
+
+    while (attempt < maxAttempts) {
+      attempt++;
+      const callStart = Date.now();
+      try {
+        const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type':      'application/json',
+            'x-api-key':         ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify({
+            // D5: opus-4-5 is the verified-working identifier in this proxy.
+            // v1.3.1 spec text said 'claude-opus-4-7' — spec to be updated.
+            model:      'claude-opus-4-5',
+            max_tokens: 500,
+            // Note 1: system prompt must be passed as array-with-cache_control,
+            // not plain string — caching depends on this shape.
+            system: [
+              {
+                type: 'text',
+                text: CUE_DOMAIN_DETECT_SYSTEM_PROMPT,
+                cache_control: { type: 'ephemeral' },
+              },
+            ],
+            messages: [{ role: 'user', content: userMessage }],
+          }),
+        });
+
+        if (!upstream.ok) {
+          throw new Error(`Anthropic API ${upstream.status}`);
+        }
+
+        const data   = await upstream.json();
+        const callMs = Date.now() - callStart;
+
+        // Telemetry — validates cost projection in first 1-2 weeks.
+        // Long-term cost monitoring needs a separate hook (Supabase log
+        // table or external service) — out of v1.3.1 scope.
+        console.log('[/cue-domain-detect] ' + JSON.stringify({
+          event:                 'domain_detect_call',
+          client_id,
+          trigger_source,
+          latency_ms:            callMs,
+          cache_creation_tokens: data.usage?.cache_creation_input_tokens || 0,
+          cache_read_tokens:     data.usage?.cache_read_input_tokens     || 0,
+          input_tokens:          data.usage?.input_tokens                || 0,
+          output_tokens:         data.usage?.output_tokens               || 0,
+          detector_version:      DOMAIN_DETECTOR_VERSION,
+          prompt_hash:           DOMAIN_DETECTOR_PROMPT_HASH,
+        }));
+
+        const rawText = data.content[0].text;
+        const cleaned = rawText.replace(/```json|```/g, '').trim();
+        parsed = JSON.parse(cleaned);
+
+        // Invariant: primary_domain null IFF confidence 0.0
+        const isPrimaryNull    = parsed.primary_domain === null;
+        const isConfidenceZero = parsed.confidence === 0.0;
+        if (isPrimaryNull !== isConfidenceZero) {
+          throw new Error(`Invariant violation: primary_domain null (${isPrimaryNull}) must match confidence 0.0 (${isConfidenceZero})`);
+        }
+
+        // Validate enum values (skip if primary is null)
+        if (!isPrimaryNull && !VALID_CLINICAL_DOMAINS.includes(parsed.primary_domain)) {
+          throw new Error(`Invalid primary_domain: ${parsed.primary_domain}`);
+        }
+        for (const d of parsed.secondary_domains || []) {
+          if (!VALID_CLINICAL_DOMAINS.includes(d)) {
+            throw new Error(`Invalid secondary_domain: ${d}`);
+          }
+        }
+        if (parsed.secondary_domains && parsed.secondary_domains.length > 2) {
+          throw new Error(`Too many secondary_domains: ${parsed.secondary_domains.length}`);
+        }
+        if (parsed.confidence < 0 || parsed.confidence > 1) {
+          throw new Error(`Invalid confidence: ${parsed.confidence}`);
+        }
+
+        // Truncate reasoning if over 200 chars
+        if (parsed.reasoning && parsed.reasoning.length > 200) {
+          console.warn(`[/cue-domain-detect] reasoning ${parsed.reasoning.length} chars, truncating`);
+          parsed.reasoning = parsed.reasoning.substring(0, 197) + '...';
+        }
+
+        break; // success
+
+      } catch (err) {
+        console.error('[/cue-domain-detect] attempt', attempt, 'failed:', err.message);
+        if (attempt >= maxAttempts) {
+          // Genuine technical failure — log to failure table (NOT insufficient-input table)
+          await db.from('detection_failure_log').insert({
+            client_id,
+            error_type:               'detection_failed_after_retry',
+            attempted_trigger_source: trigger_source,
+            detector_version:         DOMAIN_DETECTOR_VERSION,
+            input_word_count:         wordCount,
+            error_detail:             (err.message || 'unknown').substring(0, 500),
+          });
+          return res.json({
+            primary_domain:    null,
+            secondary_domains: [],
+            confidence:        null,
+            reasoning:         'Detection failed; try again when more case info is available.',
+            persisted:         false,
+            reason:            'detection_failed',
+          });
+        }
+      }
+    }
+
+    // ── Model-judged insufficient input — log to insufficient-input table,
+    // NOT failure table. Distinct signal: the model itself thinks input
+    // is too thin. Helps tune the prompt's insufficient-input threshold.
+    if (parsed.confidence === 0.0) {
+      await db.from('detection_insufficient_input_log').insert({
+        client_id,
+        source:                   'model_returned_insufficient',
+        attempted_trigger_source: trigger_source,
+        detector_version:         DOMAIN_DETECTOR_VERSION,
+        input_word_count:         wordCount,
+        model_reasoning:          parsed.reasoning,
+      });
+      return res.json({
+        ...parsed,
+        persisted: false,
+        reason:    'insufficient_input',
+      });
+    }
+
+    // ── Authority lock — defense in depth.
+    // Client-side guard is the first line (per Task 4). This check ensures
+    // we never overwrite an SLP-authoritative domain even if the guard is
+    // bypassed.
+    if (clientRow.is_slp_authoritative) {
+      return res.json({
+        ...parsed,
+        persisted: false,
+        reason:    'slp_authoritative_lock',
+      });
+    }
+
+    // ── Update clients table
+    const { error: updateErr } = await db
+      .from('clients')
+      .update({
+        primary_domain:              parsed.primary_domain,
+        secondary_domains:           parsed.secondary_domains,
+        domain_detection_confidence: parsed.confidence,
+        domain_detection_source:     trigger_source,
+        domain_detected_at:          new Date().toISOString(),
+        domain_detector_version:     DOMAIN_DETECTOR_VERSION,
+      })
+      .eq('id', client_id);
+
+    if (updateErr) {
+      console.error('[/cue-domain-detect] failed to update clients:', updateErr.message);
+      return res.status(500).json({ error: 'persist_failed' });
+    }
+
+    // ── Insert history row from application layer
+    // (auth.uid() is null in server-side context — slp_user_id passed explicitly)
+    const { error: historyErr } = await db.from('client_domain_history').insert({
+      client_id,
+      previous_primary_domain:    clientRow.primary_domain          || null,
+      new_primary_domain:         parsed.primary_domain,
+      previous_secondary_domains: clientRow.secondary_domains       || [],
+      new_secondary_domains:      parsed.secondary_domains,
+      previous_confidence:        clientRow.domain_detection_confidence || null,
+      new_confidence:             parsed.confidence,
+      changed_by:                 trigger_source,
+      changed_by_slp_id:          slpId,
+      reasoning:                  parsed.reasoning,
+      detector_version:           DOMAIN_DETECTOR_VERSION,
+    });
+
+    if (historyErr) {
+      // Update succeeded; history insert failed. Log it but don't fail the
+      // response — matches the writeAuditRow precedent in /generate-report
+      // (audit failures don't block the response).
+      console.error('[/cue-domain-detect] history insert failed (update succeeded):', historyErr.message);
+    }
+
+    return res.json({
+      ...parsed,
+      persisted: true,
+    });
+
+  } catch (err) {
+    console.error('[/cue-domain-detect] unhandled error — message:', err.message);
+    console.error('[/cue-domain-detect] unhandled error — stack:',   err.stack);
+    return res.status(500).json({ error: 'Domain detection request failed' });
+  }
+});
+
 const generateGoals = require('./routes/generateGoals');
 app.use('/api', generateGoals);
 
