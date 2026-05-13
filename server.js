@@ -1680,9 +1680,14 @@ app.post('/cue-domain-detect', requireAuth, async (req, res) => {
             'anthropic-version': '2023-06-01',
           },
           body: JSON.stringify({
-            // D5: opus-4-5 is the verified-working identifier in this proxy.
-            // v1.3.1 spec text said 'claude-opus-4-7' — spec to be updated.
-            model:      'claude-opus-4-5',
+            // Model: claude-sonnet-4-20250514 — matches the proxy's
+            // classifier-tier endpoints (/cue-reasoning, /cue-study,
+            // /generate-brief). Opus 4.5 was originally specified per
+            // v1.3.1 D5; switched to Sonnet for v1.3.2 after telemetry
+            // confirmed Opus 4.5's 4096-token caching minimum
+            // disqualified our ~1800-token system prompt from caching.
+            // Sonnet's 1024-token minimum qualifies.
+            model:      'claude-sonnet-4-20250514',
             max_tokens: 500,
             // Note 1: system prompt must be passed as array-with-cache_control,
             // not plain string — caching depends on this shape.
