@@ -274,6 +274,19 @@ router.post('/generate-goals', async (req, res) => {
 
     // Phase 1 — insert all LTGs, collect into persistedLtgs[].
     const persistedLtgs = [];
+
+    // Continue sequence_num from the client's current highest across
+    // ALL statuses so regenerations don't collide with existing goals.
+    const { data: ltgSeqRow, error: ltgSeqErr } = await db
+      .from('long_term_goals')
+      .select('sequence_num')
+      .eq('client_id', String(client_id))
+      .order('sequence_num', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (ltgSeqErr) throw new Error(`LTG sequence_num lookup failed: ${ltgSeqErr.message}`);
+    const ltgMaxSeq = ltgSeqRow?.sequence_num ?? 0;
+
     for (let i = 0; i < ltgCandidates.length; i++) {
       const ltg = ltgCandidates[i];
       const horizonMonths = ltg.horizon_months;
@@ -287,7 +300,7 @@ router.post('/generate-goals', async (req, res) => {
           client_id: String(client_id),
           user_id: user.id,
           plan_id: planId,
-          sequence_num: i + 1,
+          sequence_num: ltgMaxSeq + i + 1,
           category: null,
           domain: primaryDomain,
           framework: ltg.framework_tag ?? null,
@@ -325,11 +338,22 @@ router.post('/generate-goals', async (req, res) => {
         continue;
       }
 
+      // Identical pattern to LTGs above, scoped to this parent LTG.
+      const { data: stgSeqRow, error: stgSeqErr } = await db
+        .from('short_term_goals')
+        .select('sequence_num')
+        .eq('long_term_goal_id', ltgRow.id)
+        .order('sequence_num', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (stgSeqErr) throw new Error(`STG sequence_num lookup failed: ${stgSeqErr.message}`);
+      const stgMaxSeq = stgSeqRow?.sequence_num ?? 0;
+
       const stgRows = stgsForThisLtg.map((stg, j) => ({
         long_term_goal_id: ltgRow.id,
         client_id: String(client_id),
         user_id: user.id,
-        sequence_num: j + 1,
+        sequence_num: stgMaxSeq + j + 1,
         specific: stg.text,
         measurable: '',
         mastery_criterion: { hint: stg.mastery_hint ?? '' },
