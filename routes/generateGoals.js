@@ -97,8 +97,15 @@ router.post('/generate-goals', async (req, res) => {
       ageMonths = 0;
     }
 
+    // First name = first whitespace token of clients.name. Source of
+    // truth for the LLM's child-name rule (system_prompt_v2.md §CUE'S
+    // VOICE) and for the post-generation scrubber below.
+    const clientFullName = typeof client.name === 'string' ? client.name.trim() : '';
+    const clientFirstName = clientFullName.split(/\s+/)[0] || '';
+
     const chartPayload = {
       client: {
+        first_name: clientFirstName || null,
         age_years: ageYears,
         age_months: ageMonths,
         diagnosis: client.diagnosis ?? null,
@@ -165,6 +172,53 @@ router.post('/generate-goals', async (req, res) => {
         error: 'Cue returned non-object response',
         raw: rawText.slice(0, 500),
       });
+    }
+
+    // Hallucination scrubber — deterministic post-generation safeguard.
+    // The LLM occasionally puts an invented first name in subject
+    // position ("Priya will…"). For every generated string we are about
+    // to insert, replace any sentence-subject capitalised name token that
+    // isn't the client's real first name with the real first name, or
+    // "The client" if no real name is reliably available. Runs before
+    // every return path so safeguarding_halt and awaiting_clarification
+    // responses are also sanitised even though those paths don't write
+    // goal rows. child_name_used is canonicalised here too — the raw
+    // LLM claim never reaches the client; any defiance is logged.
+    const SUBJECT_VERB_RE = /(^|[.!?]\s+)([A-Z][a-z]{1,19})(\s+)(will|is|has|can|may|shall|does|did|attempts?|attends?|engages?|produces?|uses?|communicates?|completes?|achieves?|demonstrates?|identifies|requests?|responds?|initiates?|imitates?|labels?|points?|gestures?|maintains?|tolerates?|reads?|writes?|speaks?|signs?|selects?|chooses?|begins?|continues?|stops?|reduces?|increases?|generalises?|generalizes?)\b/g;
+    const scrubSubjectName = (text) => {
+      if (typeof text !== 'string' || !text) return text;
+      const replacement = clientFirstName || 'The client';
+      const realLower = clientFirstName.toLowerCase();
+      return text.replace(SUBJECT_VERB_RE, (m, prefix, candidate, ws, verb) => {
+        if (realLower && candidate.toLowerCase() === realLower) return m;
+        return `${prefix}${replacement}${ws}${verb}`;
+      });
+    };
+    if (Array.isArray(v2.ltg_candidates)) {
+      for (const ltg of v2.ltg_candidates) {
+        if (ltg && typeof ltg === 'object') {
+          if (typeof ltg.text === 'string') ltg.text = scrubSubjectName(ltg.text);
+          if (typeof ltg.conditions_text === 'string') ltg.conditions_text = scrubSubjectName(ltg.conditions_text);
+        }
+      }
+    }
+    if (Array.isArray(v2.stg_candidates)) {
+      for (const stg of v2.stg_candidates) {
+        if (stg && typeof stg === 'object' && typeof stg.text === 'string') {
+          stg.text = scrubSubjectName(stg.text);
+        }
+      }
+    }
+    {
+      const rawClaim = typeof v2.child_name_used === 'string' ? v2.child_name_used.trim() : '';
+      const sanitized = clientFirstName || 'the child';
+      const isCompliant = !rawClaim
+        || (clientFirstName && rawClaim.toLowerCase() === clientFirstName.toLowerCase())
+        || (!clientFirstName && rawClaim.toLowerCase() === 'the child');
+      if (!isCompliant) {
+        console.warn(`[generate-goals] child_name_used defiance: client_id=${client_id} raw=${JSON.stringify(rawClaim)} sanitized=${JSON.stringify(sanitized)}`);
+      }
+      v2.child_name_used = sanitized;
     }
 
     // SAFEGUARDING HALT — v2's safeguarding return shape ([:166-174 in
