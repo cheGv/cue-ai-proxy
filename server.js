@@ -965,6 +965,177 @@ app.post('/pre-session-brief', async (req, res) => {
   }
 });
 
+// ── Phase B chart AI — /chart-narrator + /session-headline ────────────────────
+// Short, one-line generations for the redesigned client chart. System prompts
+// live HERE, server-side, per CLAUDE.md §13 (clients send context only — never
+// a prompt). Sonnet tier matches the proxy's other classifier endpoints; the
+// system prompt is passed as a cache_control array so it qualifies for caching.
+// Both are auth-gated (requireAuth) so req.user.id is available for logging.
+
+const CHART_NARRATOR_SYSTEM_PROMPT = `You are Cue's chart narrator. You write a single sentence — never more — that describes the current clinical state of a client's chart in factual, state-voice language. You never recommend, evaluate, or interpret. You only state.
+
+You write in italic editorial register: clinical, restrained, present-tense, no AI-chatbot voice. You do not address the clinician ('you', 'your'). You refer to the client by name.
+
+Examples of correct narration:
+- 'Dina's substrate is populated — long-term goal still open.'
+- 'Ratnadeep's last session worked on vocal cord adduction — STG 6.1 in focus, voice domain, week 2 of 4.'
+- 'Asha's plan was revised last session — STG 2.B paused, regulation domain reprioritized.'
+
+Examples of WRONG narration:
+- 'Dina is doing well!' (evaluation)
+- 'I notice that Dina hasn't had her LTG authored yet.' (chatbot voice)
+- 'You should consider authoring Dina's long-term goal.' (recommendation, addressing clinician)
+- 'Dina's regulation skills are improving steadily across sessions.' (interpretation)
+
+Length: one sentence. Maximum 25 words. Use the em-dash for clinical compression. Honor Cue's language discipline — never use 'setback,' 'regression,' 'failure,' or 'deficit.' The third session outcome is 'holding.'`;
+
+const SESSION_HEADLINE_SYSTEM_PROMPT = `You are Cue's session-headline writer. You write a single line that summarizes what happened in a clinical session. You use the session's observation and clinical-read fields as source material.
+
+You write in factual past-tense. You name the clinical move and the outcome. You do not evaluate the clinician's work. You use clinician-affirming language — sessions that did not progress are 'held' or 'consolidated current state,' not 'setback' or 'failure.'
+
+Examples of correct headlines:
+- 'Co-regulation strategy introduced — Dina tolerated three transitions with caregiver scaffolding.'
+- 'AAC stimulability re-attempted — Dina initiated two communicative bids unprompted.'
+- 'Plan revised — initial regulation strategy too high-demand, scaled to caregiver-led co-regulation.'
+- 'Session consolidated current state — caregiver routines held.'
+
+Examples of WRONG headlines:
+- 'Dina did great today!' (evaluation)
+- 'Failed regulation attempt.' (deficit language)
+- 'Setback in AAC progress.' (forbidden word)
+
+Length: one line. Maximum 18 words. Match the session's clinical category (progress / plan revised / holding) in the headline's framing.`;
+
+// Pull the first text block out of an Anthropic /v1/messages response.
+function _firstTextBlock(data) {
+  const blocks = Array.isArray(data && data.content) ? data.content : [];
+  const block = blocks.find((b) => b && b.type === 'text');
+  return (block && block.text ? block.text : '').trim();
+}
+
+app.post('/chart-narrator', requireAuth, async (req, res) => {
+  try {
+    const { client_id, client_name, client_state, focused_stg } = req.body || {};
+    if (!client_name || typeof client_name !== 'string') {
+      return res.status(400).json({ error: 'client_name is required' });
+    }
+    if (!client_state || typeof client_state !== 'object') {
+      return res.status(400).json({ error: 'client_state is required' });
+    }
+
+    const context = {
+      client_id: client_id || null,
+      client_name,
+      client_state,
+      focused_stg: focused_stg || null,
+    };
+    const userMessage =
+      `Narrate the current chart state for this client. Context (JSON):\n` +
+      JSON.stringify(context, null, 2);
+
+    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model:      'claude-sonnet-4-20250514',
+        max_tokens: 50,
+        system: [
+          {
+            type: 'text',
+            text: CHART_NARRATOR_SYSTEM_PROMPT,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        messages: [{ role: 'user', content: userMessage }],
+      }),
+    });
+
+    const data = await upstream.json();
+    if (!upstream.ok) {
+      console.error('[/chart-narrator] anthropic', upstream.status,
+        data && data.error && data.error.message);
+      return res.status(upstream.status).json({
+        error: (data && data.error && data.error.message) || `Anthropic ${upstream.status}`,
+      });
+    }
+    console.log('[/chart-narrator] ' + JSON.stringify({
+      slp_id:        req.user.id,
+      input_tokens:  (data.usage && data.usage.input_tokens)  || 0,
+      output_tokens: (data.usage && data.usage.output_tokens) || 0,
+    }));
+    return res.json({ narrator: _firstTextBlock(data) });
+  } catch (err) {
+    console.error('[/chart-narrator] error:', err.message);
+    return res.status(502).json({ error: `Proxy error: ${err.message}` });
+  }
+});
+
+app.post('/session-headline', requireAuth, async (req, res) => {
+  try {
+    const {
+      session_id, client_name, session_date,
+      soap_note, notes, outcome, next_session_focus,
+    } = req.body || {};
+    if (session_id === undefined || session_id === null) {
+      return res.status(400).json({ error: 'session_id is required' });
+    }
+
+    const blocks = [];
+    if (client_name)        blocks.push(`CLIENT: ${client_name}`);
+    if (session_date)       blocks.push(`DATE: ${session_date}`);
+    if (outcome)            blocks.push(`OUTCOME: ${outcome}`);
+    if (soap_note)          blocks.push(`OBSERVATION / SOAP:\n${soap_note}`);
+    if (notes)              blocks.push(`NOTES:\n${notes}`);
+    if (next_session_focus) blocks.push(`NEXT SESSION FOCUS:\n${next_session_focus}`);
+    const userMessage = blocks.length
+      ? blocks.join('\n\n')
+      : 'No session detail provided.';
+
+    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model:      'claude-sonnet-4-20250514',
+        max_tokens: 60,
+        system: [
+          {
+            type: 'text',
+            text: SESSION_HEADLINE_SYSTEM_PROMPT,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        messages: [{ role: 'user', content: userMessage }],
+      }),
+    });
+
+    const data = await upstream.json();
+    if (!upstream.ok) {
+      console.error('[/session-headline] anthropic', upstream.status,
+        data && data.error && data.error.message);
+      return res.status(upstream.status).json({
+        error: (data && data.error && data.error.message) || `Anthropic ${upstream.status}`,
+      });
+    }
+    console.log('[/session-headline] ' + JSON.stringify({
+      slp_id:        req.user.id,
+      session_id,
+      output_tokens: (data.usage && data.usage.output_tokens) || 0,
+    }));
+    return res.json({ headline: _firstTextBlock(data) });
+  } catch (err) {
+    console.error('[/session-headline] error:', err.message);
+    return res.status(502).json({ error: `Proxy error: ${err.message}` });
+  }
+});
+
 // ── /extract — file-aware clinical data extraction ────────────────────────────
 // Accepts PDF, image/*, or DOCX (via mammoth). Builds the appropriate
 // Anthropic content block type and returns { result: "..." }.
