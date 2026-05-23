@@ -2039,6 +2039,299 @@ app.post('/cue-domain-detect', requireAuth, async (req, res) => {
   }
 });
 
+// ── Phase C — Cue Format Adaptation, Component One (Format Extractor) ──────────
+// /format-extract reads 1–5 sample reports a clinician uploaded (DOCX via
+// mammoth → HTML with structural hints; PDF via Anthropic's native document
+// block) and returns the extracted structural template. /format-confirm locks
+// the (possibly edited) template against her account. System prompt lives HERE,
+// server-side, per CLAUDE.md §13 — the client sends only file references.
+// The prompt names forbidden vocabulary ONLY as the detection target (same
+// pattern as CHART_NARRATOR_SYSTEM_PROMPT); Cue never emits it.
+
+const FORMAT_EXTRACT_SYSTEM_PROMPT = `You are Cue's format extractor. You read 1–5 sample reports from a single clinician and extract the structural template they follow.
+
+You output a strict JSON schema describing:
+
+1. The document's structural skeleton:
+   - Section list with order
+   - Sub-section hierarchy (use nested 'subsections' array)
+   - Length conventions per section ('short prose', 'bulleted list', 'table', 'paragraph')
+   - Numbering convention if any (Roman numerals, numbered, lettered)
+
+2. The placeholders — fields that differ per child:
+   - Client name, age, gender, registration number, dates, clinician name, supervisor name, language, address, referred-by
+   - Any other fields that varied across the sample reports
+
+3. The voice register:
+   - Common verbs the clinician uses ('exhibits', 'demonstrates', 'comprehends')
+   - Common phrasings ('At present, the child...', 'The client predominantly...')
+   - Sentence rhythm — short clinical bullets vs. flowing paragraphs
+   - Terminology preferences (e.g., 'clinician' vs 'therapist', 'AAC device' vs 'communication aid')
+
+4. The mapping from format sections to Cue's canonical clinical primitives:
+   - 'observation' (what the clinician noticed in sessions)
+   - 'clinical_reasoning' (clinician interpretation)
+   - 'intervention' (what the clinician did)
+   - 'outcome' (how it resolved — progress | plan_revised | holding)
+   - 'next_session_intent' (what carries forward)
+   - 'metrics' (structured numerical measurements)
+   - 'substrate' (foundational client information that persists across sessions)
+   - 'goals' (LTG and STG content)
+   - 'recommendations' (clinician's forward-looking advice)
+   - 'static_clinician_authored' (sections that don't draw from canonical session data — Background, History, etc. that the clinician fills once and refines occasionally)
+
+5. The format_type best match: 'pt_report' | 'lp_report' | 'progress_report' | 'session_note' | 'discharge_summary' | 'other'.
+
+You honor Cue's language discipline strictly. When extracting voice register, if the sample reports use forbidden vocabulary ('poor,' 'delay,' 'failure,' 'regression,' 'deficit,' 'not achieved,' 'inadequate'), note them in a separate 'forbidden_vocabulary_observed' array but do NOT include them in the voice register's recommended common_verbs or common_phrasings. The drafter (Component Two, future) will mediate these through a swap layer when generating reports.
+
+If the sample reports are inconsistent with each other (different structures, different section names across the three reports), flag the inconsistency in an 'extraction_warnings' array but produce a best-effort merged template.
+
+If a sample report is too short or too garbled to extract meaningfully, flag in extraction_warnings.
+
+You output ONLY the JSON object. No prose, no markdown, no commentary. The JSON must validate against this schema:
+
+{
+  "format_name": string,
+  "format_type": string,
+  "sections": [
+    {
+      "name": string,
+      "order": integer,
+      "length": string,
+      "numbering": string | null,
+      "subsections": [<recursive section objects>] | null,
+      "canonical_map": [string] — array of canonical primitives this section draws from
+    }
+  ],
+  "placeholders": [string],
+  "voice_register": {
+    "common_verbs": [string],
+    "common_phrasings": [string],
+    "sentence_rhythm": string,
+    "terminology_preferences": object
+  },
+  "forbidden_vocabulary_observed": [string],
+  "extraction_warnings": [string]
+}`;
+
+// Strip a ```json ... ``` fence if the model wraps its JSON despite instructions.
+function stripJsonFence(s) {
+  const t = (s || '').trim();
+  const m = t.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
+  return m ? m[1].trim() : t;
+}
+
+app.post('/format-extract', requireAuth, async (req, res) => {
+  try {
+    const { template_id, files } = req.body || {};
+    if (!template_id) {
+      return res.status(400).json({ error: 'template_id is required' });
+    }
+    if (!Array.isArray(files) || files.length === 0) {
+      return res.status(400).json({ error: 'files (non-empty array) is required' });
+    }
+    if (files.length > 5) {
+      return res.status(400).json({ error: 'A maximum of 5 sample documents is supported' });
+    }
+
+    const warnings = [];
+    const rawTextPerDocument = [];
+    const contentBlocks = [];
+    let hasPdf = false;
+
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i] || {};
+      const label = `DOCUMENT ${i + 1}` + (f.filename ? ` (${f.filename})` : '');
+      if (!f.signed_url) {
+        warnings.push(`${label}: missing signed_url — skipped`);
+        rawTextPerDocument.push('');
+        continue;
+      }
+
+      let buf;
+      try {
+        const fileResp = await fetch(f.signed_url);
+        if (!fileResp.ok) throw new Error(`HTTP ${fileResp.status}`);
+        buf = Buffer.from(await fileResp.arrayBuffer());
+      } catch (e) {
+        warnings.push(`${label}: could not fetch from storage (${e.message})`);
+        rawTextPerDocument.push('');
+        continue;
+      }
+
+      const type = (f.file_type || '').toLowerCase();
+      if (type === 'docx' || type.includes('word')) {
+        try {
+          const mammoth = require('mammoth');
+          // convertToHtml preserves headings / tables / lists as structural
+          // tags — far better extraction signal than flat raw text.
+          const out = await mammoth.convertToHtml({ buffer: buf });
+          const html = (out && out.value) || '';
+          if (html.replace(/<[^>]+>/g, '').trim().length < 40) {
+            warnings.push(`${label}: extracted text is very short — extraction may be incomplete`);
+          }
+          rawTextPerDocument.push(html);
+          contentBlocks.push({ type: 'text', text: `===== ${label} =====\n${html}` });
+        } catch (e) {
+          warnings.push(`${label}: DOCX could not be parsed (${e.message})`);
+          rawTextPerDocument.push('');
+        }
+      } else if (type === 'pdf' || type === 'application/pdf') {
+        hasPdf = true;
+        contentBlocks.push({ type: 'text', text: `===== ${label} (PDF document follows) =====` });
+        contentBlocks.push({
+          type: 'document',
+          source: { type: 'base64', media_type: 'application/pdf', data: buf.toString('base64') },
+        });
+        rawTextPerDocument.push('(PDF read natively by the model; raw text not separately extracted)');
+      } else {
+        warnings.push(`${label}: unsupported file_type '${f.file_type}' — only pdf and docx are supported`);
+        rawTextPerDocument.push('');
+      }
+    }
+
+    if (contentBlocks.length === 0) {
+      return res.status(422).json({
+        error: 'No readable documents — every upload failed to fetch or parse.',
+        code: 'EXTRACTION_FAILED',
+        extraction_warnings: warnings,
+      });
+    }
+
+    contentBlocks.push({
+      type: 'text',
+      text: 'Extract the structural template from the sample report(s) above. Output ONLY the JSON object per your schema.',
+    });
+
+    const headers = {
+      'Content-Type':      'application/json',
+      'x-api-key':         ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    };
+    if (hasPdf) headers['anthropic-beta'] = 'pdfs-2024-09-25';
+
+    let data;
+    try {
+      const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model:      'claude-opus-4-5',
+          max_tokens: 8192,
+          system: [
+            {
+              type: 'text',
+              text: FORMAT_EXTRACT_SYSTEM_PROMPT,
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+          messages: [{ role: 'user', content: contentBlocks }],
+        }),
+      });
+      data = await upstream.json();
+      if (!upstream.ok) {
+        console.error('[/format-extract] anthropic', upstream.status, data?.error?.message);
+        return res.status(upstream.status).json({
+          error: data?.error?.message || `Anthropic ${upstream.status}`,
+          code:  'UPSTREAM_ERROR',
+        });
+      }
+    } catch (e) {
+      console.error('[/format-extract] anthropic fetch failed:', e.message);
+      return res.status(502).json({ error: `Anthropic upstream failure: ${e.message}`, code: 'UPSTREAM_ERROR' });
+    }
+
+    const text = _firstTextBlock(data);
+    let extracted;
+    try {
+      extracted = JSON.parse(stripJsonFence(text));
+    } catch (e) {
+      console.error('[/format-extract] JSON parse failed; raw head:', text.slice(0, 400));
+      return res.status(502).json({
+        error: 'The format could not be parsed into a clean template. Try re-uploading clearer copies of your reports.',
+        code:  'PARSE_ERROR',
+      });
+    }
+
+    const modelWarnings = Array.isArray(extracted.extraction_warnings) ? extracted.extraction_warnings : [];
+    const allWarnings = [...warnings, ...modelWarnings];
+
+    console.log('[/format-extract] ' + JSON.stringify({
+      slp_id:        req.user.id,
+      template_id,
+      docs:          files.length,
+      input_tokens:  data.usage?.input_tokens  || 0,
+      output_tokens: data.usage?.output_tokens || 0,
+      warnings:      allWarnings.length,
+    }));
+
+    return res.json({
+      extracted_template:    extracted,
+      extraction_warnings:   allWarnings,
+      raw_text_per_document: rawTextPerDocument,
+    });
+  } catch (err) {
+    console.error('[/format-extract] error:', err.message, err.stack);
+    return res.status(500).json({ error: `Format extraction failed: ${err.message}` });
+  }
+});
+
+app.post('/format-confirm', requireAuth, async (req, res) => {
+  try {
+    const { template_id, confirmed_template } = req.body || {};
+    if (!template_id) {
+      return res.status(400).json({ error: 'template_id is required' });
+    }
+    if (!confirmed_template || typeof confirmed_template !== 'object' || Array.isArray(confirmed_template)) {
+      return res.status(400).json({ error: 'confirmed_template (object) is required' });
+    }
+
+    // Minimal schema validation — required top-level keys + sections shape.
+    const required = ['format_name', 'format_type', 'sections'];
+    const missing = required.filter((k) => !(k in confirmed_template));
+    if (missing.length > 0) {
+      return res.status(400).json({ error: `confirmed_template missing keys: ${missing.join(', ')}`, code: 'SCHEMA_INVALID' });
+    }
+    if (!Array.isArray(confirmed_template.sections)) {
+      return res.status(400).json({ error: 'confirmed_template.sections must be an array', code: 'SCHEMA_INVALID' });
+    }
+
+    const db = createClient(SUPABASE_URL, SUPABASE_SERVICE);
+    const confirmedAt = new Date().toISOString();
+
+    // Ownership-scoped update — even with the service-role client we constrain
+    // to the authenticated clinician's own row.
+    const { data, error } = await db
+      .from('format_templates')
+      .update({
+        extracted_template:  confirmed_template,
+        confirmation_status: 'confirmed',
+        confirmed_at:        confirmedAt,
+        updated_at:          confirmedAt,
+      })
+      .eq('id', template_id)
+      .eq('user_id', req.user.id)
+      .select('id, confirmed_at')
+      .maybeSingle();
+
+    if (error) {
+      console.error('[/format-confirm] update error:', error.message);
+      return res.status(500).json({ error: 'Failed to confirm template' });
+    }
+    if (!data) {
+      return res.status(404).json({ error: 'Template not found or access denied', code: 'NOT_FOUND' });
+    }
+
+    console.log('[/format-confirm] ' + JSON.stringify({
+      slp_id: req.user.id, template_id, confirmed_at: data.confirmed_at,
+    }));
+    return res.json({ template_id: data.id, confirmed_at: data.confirmed_at });
+  } catch (err) {
+    console.error('[/format-confirm] error:', err.message);
+    return res.status(500).json({ error: `Format confirm failed: ${err.message}` });
+  }
+});
+
 const generateGoals = require('./routes/generateGoals');
 app.use('/api', generateGoals);
 
