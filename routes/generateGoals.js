@@ -4,6 +4,7 @@ const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
+const requireAuth = require('../middleware/requireAuth');
 
 const SUPABASE_URL     = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -21,21 +22,9 @@ const SYSTEM_PROMPT = SYSTEM_PROMPT_RAW
   .replace(/^<!--[\s\S]*?-->\s*/, '')
   .trim();
 
-router.post('/generate-goals', async (req, res) => {
-  const authHeader = req.headers['authorization'];
-  if (!authHeader?.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing authorization header' });
-  }
-  const token = authHeader.split(' ')[1];
-
-  const userClient = createClient(SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
-    global: { headers: { Authorization: `Bearer ${token}` } }
-  });
-
-  const { data: { user }, error: authError } = await userClient.auth.getUser();
-  if (authError || !user) {
-    return res.status(401).json({ error: 'Invalid or expired token' });
-  }
+router.post('/generate-goals', requireAuth, async (req, res) => {
+  // Auth is issuer-aware via requireAuth; req.user + req.authEnv are set.
+  const user = req.user;
 
   const {
     client_id,
@@ -53,7 +42,7 @@ router.post('/generate-goals', async (req, res) => {
     return res.status(400).json({ error: 'clinical_area (or legacy clarifying_answers) is required' });
   }
 
-  const db = createClient(SUPABASE_URL, SUPABASE_SERVICE);
+  const db = createClient(req.authEnv.url, req.authEnv.serviceRoleKey);
 
   try {
     const [clientRes, sessionsRes, goalsRes, frameworksRes] = await Promise.all([
@@ -479,26 +468,16 @@ router.post('/generate-goals', async (req, res) => {
   }
 });
 
-router.post('/attest-goals', async (req, res) => {
-  const authHeader = req.headers['authorization'];
-  if (!authHeader?.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing authorization header' });
-  }
-  const token = authHeader.split(' ')[1];
-
-  const userClient = createClient(SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
-    global: { headers: { Authorization: `Bearer ${token}` } }
-  });
-
-  const { data: { user }, error: authError } = await userClient.auth.getUser();
-  if (authError || !user) return res.status(401).json({ error: 'Invalid token' });
+router.post('/attest-goals', requireAuth, async (req, res) => {
+  // Auth is issuer-aware via requireAuth; req.user + req.authEnv are set.
+  const user = req.user;
 
   const { plan_id, rci_number } = req.body;
   if (!plan_id || !rci_number) {
     return res.status(400).json({ error: 'plan_id and rci_number required' });
   }
 
-  const db = createClient(SUPABASE_URL, SUPABASE_SERVICE);
+  const db = createClient(req.authEnv.url, req.authEnv.serviceRoleKey);
 
   const [planRes, ltgRes] = await Promise.all([
     db.from('goal_plans').select('*').eq('id', plan_id).eq('user_id', user.id).single(),

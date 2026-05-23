@@ -501,7 +501,7 @@ async function writeAuditRow(db, row) {
 app.post('/generate-report', requireAuth, async (req, res) => {
   const startedAt    = Date.now();
   const requestBytes = JSON.stringify(req.body || {}).length;
-  const db           = createClient(SUPABASE_URL, SUPABASE_SERVICE);
+  const db           = createClient(req.authEnv.url, req.authEnv.serviceRoleKey);
   const clinicianId  = req.user.id;
 
   const {
@@ -1351,7 +1351,7 @@ app.post('/cue-reasoning', requireAuth, async (req, res) => {
     }
 
     const slpId = req.user.id;
-    const db    = createClient(SUPABASE_URL, SUPABASE_SERVICE);
+    const db    = createClient(req.authEnv.url, req.authEnv.serviceRoleKey);
 
     // ── Ownership-and-fetch: one query, two outcomes ─────────────────────────
     // Row returned → authenticated SLP owns this client; use the data.
@@ -1779,7 +1779,7 @@ app.post('/cue-domain-detect', requireAuth, async (req, res) => {
     }
 
     const slpId = req.user.id;
-    const db    = createClient(SUPABASE_URL, SUPABASE_SERVICE);
+    const db    = createClient(req.authEnv.url, req.authEnv.serviceRoleKey);
 
     // ── Ownership-and-fetch: one query, two outcomes ─────────────────────────
     // Row returned → authenticated SLP owns this client; use the data.
@@ -2296,7 +2296,7 @@ app.post('/format-confirm', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'confirmed_template.sections must be an array', code: 'SCHEMA_INVALID' });
     }
 
-    const db = createClient(SUPABASE_URL, SUPABASE_SERVICE);
+    const db = createClient(req.authEnv.url, req.authEnv.serviceRoleKey);
     const confirmedAt = new Date().toISOString();
 
     // Ownership-scoped update — even with the service-role client we constrain

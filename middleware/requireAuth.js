@@ -1,28 +1,35 @@
-// Phase 4.0.7.40-proxy-rebuild — JWT verification middleware.
+// Phase C — issuer-aware JWT verification middleware.
 //
-// Mirrors the inline auth pattern that ships in
-// routes/generateGoals.js (lines 24-38). Extracted here so
-// /generate-report (and future endpoints that need clinician
-// identity for RLS-aware DB writes or audit logging) can mount
-// it as a single line.
+// The proxy fronts TWO Supabase projects (production + sandbox) from a
+// single deployment. The incoming token's `iss` claim says which project
+// minted it; resolveAuthEnvironment() (lib/resolveAuthEnvironment.js) maps
+// that to the project's URL + anon/service-role keys WITHOUT trusting the
+// token yet. auth.getUser() then verifies the token against the resolved
+// project's GoTrue — the real cryptographic check.
 //
 // Behavior:
-//   • Reads Authorization: Bearer <token> from the request.
-//   • Validates the token via @supabase/supabase-js
-//     (auth.getUser hits the live JWKS endpoint, so key
-//     rotation, revocation, and expiry are honored without
-//     local caching).
-//   • On success: attaches `req.user` (the Supabase auth user
-//     object — `req.user.id` is the clinician_id used downstream).
+//   • Reads Authorization: Bearer <token>.
+//   • Resolves the token's project by its iss claim. Unknown issuer or a
+//     malformed token → 401 (never reaches GoTrue).
+//   • Verifies via auth.getUser() against the RESOLVED project URL + anon.
+//   • On success: attaches `req.user` (the Supabase auth user object —
+//     `req.user.id` is the clinician_id used downstream) and `req.authEnv`
+//     = { env, url, serviceRoleKey } so downstream service-role DB writes
+//     target the SAME project without re-decoding the token.
 //   • On failure: responds 401 with a JSON error and short-circuits.
 //
-// Required env vars: SUPABASE_URL, SUPABASE_ANON_KEY. Both are
-// already configured on Render for /api/generate-goals.
+// Prod behavior is unchanged: a prod token resolves to the exact same URL
+// + keys this middleware used before (process.env.SUPABASE_URL etc.). The
+// sandbox branch only activates for sandbox-issued tokens, and only when
+// the SUPABASE_*_SANDBOX env vars are present.
 //
-// generateGoals.js intentionally keeps its inline copy for
-// 4.0.7.40 scope discipline; a follow-up phase can DRY it.
+// Required env vars:
+//   prod    — SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY
+//   sandbox — SUPABASE_URL_SANDBOX, SUPABASE_ANON_KEY_SANDBOX,
+//             SUPABASE_SERVICE_ROLE_KEY_SANDBOX
 
 const { createClient } = require('@supabase/supabase-js');
+const { resolveAuthEnvironment } = require('../lib/resolveAuthEnvironment');
 
 module.exports = async function requireAuth(req, res, next) {
   const auth = req.headers['authorization'];
@@ -31,9 +38,17 @@ module.exports = async function requireAuth(req, res, next) {
   }
   const token = auth.split(' ')[1];
 
+  let resolved;
+  try {
+    resolved = resolveAuthEnvironment(token);
+  } catch (e) {
+    // Unknown issuer or malformed token — reject before any network call.
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+
   const userClient = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_ANON_KEY,
+    resolved.url,
+    resolved.anonKey,
     { global: { headers: { Authorization: `Bearer ${token}` } } }
   );
 
@@ -43,6 +58,13 @@ module.exports = async function requireAuth(req, res, next) {
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
     req.user = user;
+    // Resolved environment travels with the request so downstream
+    // service-role clients hit the same project (no second iss decode).
+    req.authEnv = {
+      env: resolved.env,
+      url: resolved.url,
+      serviceRoleKey: resolved.serviceRoleKey,
+    };
     return next();
   } catch (e) {
     console.error('[requireAuth] verification exception:', e.message);
