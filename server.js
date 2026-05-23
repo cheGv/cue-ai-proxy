@@ -2332,6 +2332,196 @@ app.post('/format-confirm', requireAuth, async (req, res) => {
   }
 });
 
+// ── Phase C — Cue Mirror, Component Two (Format Drafter) ──────────────────────
+// /format-draft maps a client's canonical clinical data into the SLP's locked
+// format template and returns a structured, source-traceable draft. System
+// prompt lives HERE, server-side, per §13 — the client sends only the locked
+// template + canonical data + the SLP's lexicon decisions (no prompt). The
+// prompt names forbidden vocabulary ONLY as the detection/replacement target
+// (same exception pattern as the extractor); Cue's emitted defaults are neutral.
+// Stateless: persistence to format_drafts is the Flutter service's job.
+
+const FORMAT_DRAFT_SYSTEM_PROMPT = `You are Cue's format drafter. You generate a structured clinical report by mapping a client's canonical clinical data into the SLP's locked format template.
+
+Your output is a JSON array of sections. Each section has:
+- section_name: matches the locked template's section name exactly
+- content: the prose, bulleted list, table, or other structured content for this section
+- source_claims: an array of every clinical claim in the content with its source. Each claim has:
+  - claim_text: the exact text in the content that makes the claim
+  - source_type: one of 'session' | 'substrate' | 'goal' | 'citation' | 'static_clinician_authored'
+  - source_id: the UUID or identifier of the source row
+  - source_excerpt: the relevant text from the source that supports the claim
+- lexicon_swaps: an array of every place you replaced a forbidden term with a neutral term, per the SLP's lexicon defaults
+
+RULES (these are non-negotiable):
+
+1. Every clinical claim about this child MUST trace to a specific source in the canonical_data provided. If you cannot find a source for a claim, do NOT include the claim. Use neutral placeholder text like '[Not assessed in current session range]' instead.
+
+2. You may ONLY draw on canonical primitives mapped to each section. Each section in the locked template has a canonical_map array. Use ONLY those primitives for that section. If section X maps to ['observation'], do not pull from clinical_reasoning or goals for that section.
+
+3. Honor the SLP's lexicon_defaults exactly. If a forbidden term has decision='swap', replace it with replacement_term and record the swap. If decision='keep_original', use the original term and do NOT record a swap. If a forbidden term appears in canonical data but has NO entry in lexicon_defaults, default to swapping it with Cue's neutral replacement and record the swap.
+
+Cue's default neutral replacements (used when no SLP override):
+- 'delay' → 'emerging speech and language profile'
+- 'poor' → 'emerging'
+- 'decline' → 'shift in profile'
+- 'deficit' → 'area for support'
+- 'failure' → 'opportunity for further work'
+- 'regression' → 'shift in skills profile'
+- 'not achieved' → 'in progress'
+- 'inadequate' → 'developing'
+
+4. Match the locked template's voice register. Use the common_verbs and common_phrasings from the template's voice_register. Match the sentence_rhythm. Do not introduce vocabulary or sentence patterns that aren't in the SLP's voice.
+
+5. For sections with canonical_map=['static_clinician_authored'] (Header, Background, History) — these are clinician-authored sections that don't draw from session-by-session data. Output placeholder text indicating 'To be authored by clinician' or similar. The Trust UI (Component Three, future) will let the SLP author these once and reuse them.
+
+6. Honor each section's length convention. 'short prose' = 2-4 sentences. 'paragraph' = 1-2 paragraphs. 'bulleted list' = structured bullets. 'table' = structured rows.
+
+7. If the date range filtered the session data to zero or one sessions and the section expects multi-session synthesis, note this honestly: 'Single session within date range; longitudinal patterns not yet observable.'
+
+You output ONLY the JSON array. No prose, no markdown, no commentary. The output must validate against:
+
+[
+  {
+    "section_name": string,
+    "content": string,
+    "source_claims": [
+      {
+        "claim_text": string,
+        "source_type": "session" | "substrate" | "goal" | "citation" | "static_clinician_authored",
+        "source_id": string,
+        "source_excerpt": string
+      }
+    ],
+    "lexicon_swaps": [
+      {
+        "original": string,
+        "replacement": string,
+        "position_in_content": integer
+      }
+    ]
+  }
+]`;
+
+app.post('/format-draft', requireAuth, async (req, res) => {
+  try {
+    const { template_id, client_id, date_range, locked_template, lexicon_defaults, canonical_data } = req.body || {};
+    if (!template_id) {
+      return res.status(400).json({ error: 'template_id is required' });
+    }
+    if (!client_id) {
+      return res.status(400).json({ error: 'client_id is required' });
+    }
+    if (!locked_template || typeof locked_template !== 'object' || Array.isArray(locked_template)) {
+      return res.status(400).json({ error: 'locked_template (object) is required' });
+    }
+    if (!canonical_data || typeof canonical_data !== 'object' || Array.isArray(canonical_data)) {
+      return res.status(400).json({ error: 'canonical_data (object) is required' });
+    }
+
+    const userPayload = {
+      date_range: date_range || null,
+      locked_template,
+      lexicon_defaults: Array.isArray(lexicon_defaults) ? lexicon_defaults : [],
+      canonical_data,
+    };
+    const userText =
+      'Draft the report now. Map the canonical clinical data into the locked format template, ' +
+      'section by section, in the template’s order, following every rule in your instructions.\n\n' +
+      'INPUT:\n' + JSON.stringify(userPayload) + '\n\n' +
+      'Output ONLY the JSON array of section objects.';
+
+    const startedAt = Date.now();
+    let data;
+    try {
+      const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type':      'application/json',
+          'x-api-key':         ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model:      'claude-opus-4-5',
+          max_tokens: 16384,
+          system: [
+            {
+              type: 'text',
+              text: FORMAT_DRAFT_SYSTEM_PROMPT,
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+          messages: [{ role: 'user', content: userText }],
+        }),
+      });
+      data = await upstream.json();
+      if (!upstream.ok) {
+        console.error('[/format-draft] anthropic', upstream.status, data?.error?.message);
+        return res.status(upstream.status).json({
+          error: data?.error?.message || `Anthropic ${upstream.status}`,
+          code:  'UPSTREAM_ERROR',
+        });
+      }
+    } catch (e) {
+      console.error('[/format-draft] anthropic fetch failed:', e.message);
+      return res.status(502).json({ error: `Anthropic upstream failure: ${e.message}`, code: 'UPSTREAM_ERROR' });
+    }
+    const latencyMs = Date.now() - startedAt;
+
+    const text = _firstTextBlock(data);
+    let draftSections;
+    try {
+      draftSections = JSON.parse(stripJsonFence(text));
+    } catch (e) {
+      console.error('[/format-draft] JSON parse failed; raw head:', text.slice(0, 400));
+      return res.status(502).json({
+        error: 'The draft could not be parsed into clean sections. Please try generating again.',
+        code:  'PARSE_ERROR',
+      });
+    }
+    if (!Array.isArray(draftSections)) {
+      console.error('[/format-draft] model did not return an array; type:', typeof draftSections);
+      return res.status(502).json({
+        error: 'The draft did not come back as a list of sections. Please try generating again.',
+        code:  'SCHEMA_INVALID',
+      });
+    }
+
+    const lt = locked_template || {};
+    const generationMetadata = {
+      model: 'claude-opus-4-5',
+      tokens: {
+        input_tokens:  data.usage?.input_tokens  || 0,
+        output_tokens: data.usage?.output_tokens || 0,
+      },
+      latency_ms: latencyMs,
+      template_version_snapshot: {
+        format_name:   lt.format_name || '',
+        format_type:   lt.format_type || '',
+        section_count: Array.isArray(lt.sections) ? lt.sections.length : 0,
+      },
+    };
+
+    console.log('[/format-draft] ' + JSON.stringify({
+      slp_id:        req.user.id,
+      template_id,
+      client_id,
+      sections:      draftSections.length,
+      input_tokens:  generationMetadata.tokens.input_tokens,
+      output_tokens: generationMetadata.tokens.output_tokens,
+      latency_ms:    latencyMs,
+    }));
+
+    return res.json({
+      draft_sections:      draftSections,
+      generation_metadata: generationMetadata,
+    });
+  } catch (err) {
+    console.error('[/format-draft] error:', err.message, err.stack);
+    return res.status(500).json({ error: `Format draft failed: ${err.message}` });
+  }
+});
+
 const generateGoals = require('./routes/generateGoals');
 app.use('/api', generateGoals);
 
