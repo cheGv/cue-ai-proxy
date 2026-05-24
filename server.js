@@ -20,6 +20,19 @@ const PORT              = process.env.PORT || 3001;
 // endpoints stay unauthenticated until each is rebuilt.
 const requireAuth = require('./middleware/requireAuth');
 const { buildReportDocx } = require('./lib/buildReportDocx');
+const nlp = require('compromise');
+
+// Phase D — split a section's content into sentences. compromise handles
+// clinical abbreviations ("Dr.", "i.e.") and decimals ("8.2") without false
+// splits. Falls back to the whole trimmed string if nothing splits.
+function splitSentences(content) {
+  const out = nlp(String(content || '')).sentences().out('array')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (out.length) return out;
+  const whole = String(content || '').trim();
+  return whole ? [whole] : [];
+}
 
 // ── Cue Reasoning system prompt (separate file — kept raw for readability) ────
 const { CUE_REASONING_SYSTEM_PROMPT } = require('./prompts/cueReasoning');
@@ -2503,17 +2516,106 @@ app.post('/format-draft', requireAuth, async (req, res) => {
       },
     };
 
+    // ── Phase D — atomic persistence: format_drafts + format_draft_sentences ──
+    // The proxy is the single authoritative writer. INSERT the draft row, then
+    // split each section into sentences and INSERT the corpus rows. On sentence
+    // failure we delete the draft (FK CASCADE) so no orphan draft is returned.
+    const db = createClient(req.authEnv.url, req.authEnv.serviceRoleKey);
+    const dr = date_range || {};
+    const { data: draftRow, error: draftErr } = await db
+      .from('format_drafts')
+      .insert({
+        user_id:             req.user.id,
+        client_id,
+        template_id,
+        date_range_preset:   dr.preset || null,
+        date_range_start:    dr.start  || null,
+        date_range_end:      dr.end    || null,
+        draft_sections:      draftSections,
+        generation_metadata: generationMetadata,
+        status:              'draft',
+      })
+      .select('id')
+      .single();
+    if (draftErr || !draftRow) {
+      console.error('[/format-draft] draft insert error:', draftErr && draftErr.message);
+      return res.status(500).json({ error: 'Failed to save the draft' });
+    }
+    const draftId = draftRow.id;
+
+    // Substrate context snapshotted once at generation time (v1: whole-client
+    // substrate; per-section relevance is a week-two refinement).
+    const substrateSnapshot =
+      (canonical_data && Array.isArray(canonical_data.substrate_cells))
+        ? { substrate_cells: canonical_data.substrate_cells }
+        : null;
+
+    const sentenceRows = [];
+    for (const section of draftSections) {
+      const sectionName = (section.section_name || '').toString();
+      const content     = (section.content || '').toString();
+      const claims      = Array.isArray(section.source_claims) ? section.source_claims : [];
+      const swaps       = Array.isArray(section.lexicon_swaps) ? section.lexicon_swaps : [];
+      // Static-authored sections carry no Cue-drafted prose — the clinician
+      // authors them fresh in Component Three, so we don't pre-seed rows.
+      const isStatic =
+        claims.length === 1 && claims[0] && claims[0].source_type === 'static_clinician_authored';
+      if (isStatic || content.trim() === '') continue;
+
+      const sentences = splitSentences(content);
+      if (sentences.length === 0) continue;
+      // v1 attachment heuristic: 1:1 by order when counts match; otherwise all
+      // to the longest sentence. Week two → LLM-explicit per-sentence claims.
+      const longestIdx = sentences.reduce(
+        (best, s, i) => (s.length > sentences[best].length ? i : best), 0);
+      sentences.forEach((sentenceText, idx) => {
+        const attach = (arr) =>
+          arr.length === 0
+            ? []
+            : arr.length === sentences.length
+              ? [arr[idx]]
+              : (idx === longestIdx ? arr : []);
+        sentenceRows.push({
+          draft_id:           draftId,
+          section_name:       sectionName,
+          sentence_order:     idx,
+          text:               sentenceText,
+          text_original:      sentenceText,
+          status:             'cue_drafted',
+          source_claims:      attach(claims),
+          lexicon_swaps:      attach(swaps),
+          clinician_id:       req.user.id,
+          template_id,
+          substrate_snapshot: substrateSnapshot,
+        });
+      });
+    }
+
+    if (sentenceRows.length > 0) {
+      const { error: sentErr } = await db
+        .from('format_draft_sentences')
+        .insert(sentenceRows);
+      if (sentErr) {
+        console.error('[/format-draft] sentence insert error:', sentErr.message);
+        await db.from('format_drafts').delete().eq('id', draftId); // rollback
+        return res.status(500).json({ error: 'Failed to save the draft sentences' });
+      }
+    }
+
     console.log('[/format-draft] ' + JSON.stringify({
       slp_id:        req.user.id,
+      draft_id:      draftId,
       template_id,
       client_id,
       sections:      draftSections.length,
+      sentences:     sentenceRows.length,
       input_tokens:  generationMetadata.tokens.input_tokens,
       output_tokens: generationMetadata.tokens.output_tokens,
       latency_ms:    latencyMs,
     }));
 
     return res.json({
+      draft_id:            draftId,
       draft_sections:      draftSections,
       generation_metadata: generationMetadata,
     });
