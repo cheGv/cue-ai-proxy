@@ -19,6 +19,7 @@ const PORT              = process.env.PORT || 3001;
 // /generate-report. Mounted per-route, not globally, so legacy
 // endpoints stay unauthenticated until each is rebuilt.
 const requireAuth = require('./middleware/requireAuth');
+const { buildReportDocx } = require('./lib/buildReportDocx');
 
 // ── Cue Reasoning system prompt (separate file — kept raw for readability) ────
 const { CUE_REASONING_SYSTEM_PROMPT } = require('./prompts/cueReasoning');
@@ -2519,6 +2520,119 @@ app.post('/format-draft', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('[/format-draft] error:', err.message, err.stack);
     return res.status(500).json({ error: `Format draft failed: ${err.message}` });
+  }
+});
+
+// ── Phase C — Cue Mirror Component Four (Word export) ─────────────────────────
+// /format-draft-export renders a stored draft into a .docx in the clinician's
+// locked format, uploads it to the private format_draft_exports bucket, records
+// the export on the draft row, and returns a short-lived signed download URL.
+// No LLM call (§13: nothing to prompt). Ownership is enforced on every row even
+// though the service-role client bypasses RLS.
+app.post('/format-draft-export', requireAuth, async (req, res) => {
+  try {
+    const { draft_id, format } = req.body || {};
+    if (!draft_id) {
+      return res.status(400).json({ error: 'draft_id is required' });
+    }
+    const fmt = format || 'docx';
+    if (fmt !== 'docx') {
+      return res.status(400).json({ error: `Unsupported export format: ${fmt}`, code: 'UNSUPPORTED_FORMAT' });
+    }
+
+    const db = createClient(req.authEnv.url, req.authEnv.serviceRoleKey);
+
+    // Load the draft — ownership-scoped even under the service-role client.
+    const { data: draft, error: draftErr } = await db
+      .from('format_drafts')
+      .select('id, user_id, client_id, template_id, draft_sections, generation_metadata')
+      .eq('id', draft_id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (draftErr) {
+      console.error('[/format-draft-export] draft load error:', draftErr.message);
+      return res.status(500).json({ error: 'Failed to load the draft' });
+    }
+    if (!draft) {
+      return res.status(404).json({ error: 'Draft not found or access denied', code: 'NOT_FOUND' });
+    }
+
+    // Load the locked template (format_name + per-section length conventions).
+    const { data: template } = await db
+      .from('format_templates')
+      .select('name, extracted_template')
+      .eq('id', draft.template_id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+
+    // Load the client name (filename + document header).
+    const { data: client } = await db
+      .from('clients')
+      .select('name')
+      .eq('id', draft.client_id)
+      .maybeSingle();
+
+    const extractedTemplate = (template && template.extracted_template) || {};
+    const snapshot = (draft.generation_metadata && draft.generation_metadata.template_version_snapshot) || {};
+    const formatName =
+      (extractedTemplate.format_name && String(extractedTemplate.format_name).trim()) ||
+      (template && template.name && String(template.name).trim()) ||
+      (snapshot.format_name && String(snapshot.format_name).trim()) ||
+      'Report';
+    const clientName = (client && client.name && String(client.name).trim()) || 'Client';
+
+    // Render the .docx (review markers/swaps stripped; placeholders highlighted).
+    const buffer = await buildReportDocx({
+      formatName,
+      clientName,
+      draftSections: draft.draft_sections,
+      extractedTemplate,
+    });
+
+    // Filename: {client}_{format}_{date}.docx, filesystem-safe.
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const safe = (s) => String(s).replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, ' ').trim();
+    const filename = `${safe(clientName)}_${safe(formatName)}_${dateStr}.docx`;
+    const objectPath = `${req.user.id}/${draft.id}/${filename}`;
+
+    // Upload to the private exports bucket. Service-role bypasses storage RLS;
+    // the per-user path prefix keeps direct client access RLS-correct.
+    const { error: upErr } = await db.storage
+      .from('format_draft_exports')
+      .upload(objectPath, buffer, {
+        contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        upsert: true,
+      });
+    if (upErr) {
+      console.error('[/format-draft-export] upload error:', upErr.message);
+      return res.status(500).json({ error: 'Failed to store the export' });
+    }
+
+    // Record the export on the draft row.
+    const exportedAt = new Date().toISOString();
+    await db
+      .from('format_drafts')
+      .update({ exported_at: exportedAt, export_path: objectPath, export_format: 'docx' })
+      .eq('id', draft.id)
+      .eq('user_id', req.user.id);
+
+    // Short-lived signed download URL (1 hour).
+    const { data: signed, error: signErr } = await db.storage
+      .from('format_draft_exports')
+      .createSignedUrl(objectPath, 3600);
+    if (signErr || !signed) {
+      console.error('[/format-draft-export] sign error:', signErr && signErr.message);
+      return res.status(500).json({ error: 'Export saved, but the download link could not be created' });
+    }
+
+    console.log('[/format-draft-export] ' + JSON.stringify({
+      slp_id: req.user.id, draft_id: draft.id, bytes: buffer.length, path: objectPath,
+    }));
+
+    return res.json({ signed_url: signed.signedUrl, filename });
+  } catch (err) {
+    console.error('[/format-draft-export] error:', err.message, err.stack);
+    return res.status(500).json({ error: `Export failed: ${err.message}` });
   }
 });
 
