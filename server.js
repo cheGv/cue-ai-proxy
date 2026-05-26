@@ -2738,6 +2738,207 @@ app.post('/format-draft-export', requireAuth, async (req, res) => {
   }
 });
 
+// ── Phase D week 2 — Cue Mirror format-mirroring engine ───────────────────────
+// /format-extract-v2 deterministically parses ONE uploaded .docx into its exact
+// visual geometry (page setup, tables, runs, numbering, embedded media) and
+// stores it in format_templates.format_geometry. NO LLM (§13: nothing to
+// prompt — the LLM never sees format, Mirror C2). Media bytes go to the private
+// format_template_media bucket; the stored geometry holds storage paths, not
+// bytes. The env (sandbox/prod) is chosen by the token issuer (req.authEnv);
+// the app auths against sandbox, so this writes sandbox.
+const { extractGeometry } = require('./lib/extractGeometry');
+const { buildReportDocxV2 } = require('./lib/buildReportDocxV2');
+
+function _mediaContentType(ext) {
+  switch ((ext || 'png').toLowerCase()) {
+    case 'jpg': case 'jpeg': return 'image/jpeg';
+    case 'gif': return 'image/gif';
+    case 'svg': return 'image/svg+xml';
+    case 'bmp': return 'image/bmp';
+    default: return 'image/png';
+  }
+}
+
+app.post('/format-extract-v2', requireAuth, async (req, res) => {
+  try {
+    const { template_id, files } = req.body || {};
+    if (!template_id) return res.status(400).json({ error: 'template_id is required' });
+    if (!Array.isArray(files) || files.length === 0) {
+      return res.status(400).json({ error: 'files (non-empty array) is required' });
+    }
+    // Geometry mirrors ONE primary document — the first .docx.
+    const docxFile = files.find((f) => (f.file_type || '').toLowerCase().includes('doc')) || files[0];
+    if (!docxFile || !docxFile.signed_url) {
+      return res.status(422).json({ error: 'A .docx source with a signed_url is required', code: 'NO_DOCX' });
+    }
+    if ((docxFile.file_type || '').toLowerCase() === 'pdf') {
+      return res.status(422).json({ error: 'Geometry mirroring requires a .docx (PDF has no recoverable OOXML geometry)', code: 'PDF_UNSUPPORTED' });
+    }
+
+    let buf;
+    try {
+      const r = await fetch(docxFile.signed_url);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      buf = Buffer.from(await r.arrayBuffer());
+    } catch (e) {
+      return res.status(502).json({ error: `Could not fetch source from storage: ${e.message}` });
+    }
+
+    let geometry;
+    try {
+      geometry = await extractGeometry(buf);
+    } catch (e) {
+      console.error('[/format-extract-v2] parse failed:', e.message);
+      return res.status(422).json({ error: `Could not parse document geometry: ${e.message}`, code: 'GEOMETRY_PARSE_FAILED' });
+    }
+
+    const db = createClient(req.authEnv.url, req.authEnv.serviceRoleKey);
+
+    // Upload media bytes to the private per-user media bucket; geometry stores
+    // storage paths, never bytes.
+    const storedMedia = [];
+    for (let i = 0; i < geometry.media.length; i++) {
+      const m = geometry.media[i];
+      const objectPath = `${req.user.id}/${template_id}/${m.id || `image${i}.${m.ext}`}`;
+      const { error: upErr } = await db.storage
+        .from('format_template_media')
+        .upload(objectPath, m.bytes, { contentType: _mediaContentType(m.ext), upsert: true });
+      if (upErr) console.error('[/format-extract-v2] media upload error:', upErr.message);
+      storedMedia.push({
+        id: m.id, rel_id: m.rel_id, part: m.part, ext: m.ext,
+        storage_path: objectPath, anchor: m.anchor, wrap_mode: m.wrap_mode,
+      });
+    }
+
+    const geometryToStore = {
+      engine: 'format-extract-v2',
+      extracted_at: new Date().toISOString(),
+      page_setup: geometry.page_setup,
+      default_font: geometry.default_font,
+      numbering_definitions: geometry.numbering_definitions,
+      structure: geometry.structure,
+      media: storedMedia,
+      counts: geometry.counts,
+    };
+
+    const { data, error } = await db
+      .from('format_templates')
+      .update({ format_geometry: geometryToStore, updated_at: new Date().toISOString() })
+      .eq('id', template_id)
+      .eq('user_id', req.user.id)
+      .select('id')
+      .maybeSingle();
+    if (error) {
+      console.error('[/format-extract-v2] store error:', error.message);
+      return res.status(500).json({ error: 'Failed to store geometry' });
+    }
+    if (!data) return res.status(404).json({ error: 'Template not found or access denied', code: 'NOT_FOUND' });
+
+    console.log('[/format-extract-v2] ' + JSON.stringify({
+      slp_id: req.user.id, template_id,
+      tables: geometry.counts.tables, images: geometry.counts.images,
+      cols: geometry.counts.main_table_columns,
+    }));
+    return res.json({
+      template_id,
+      geometry: {
+        page_setup: geometryToStore.page_setup,
+        default_font: geometryToStore.default_font,
+        counts: geometryToStore.counts,
+        media: storedMedia.map((m) => ({ id: m.id, storage_path: m.storage_path, anchor: m.anchor, wrap_mode: m.wrap_mode })),
+      },
+    });
+  } catch (err) {
+    console.error('[/format-extract-v2] error:', err.message, err.stack);
+    return res.status(500).json({ error: `Geometry extraction failed: ${err.message}` });
+  }
+});
+
+// /format-mirror-render — verbatim re-render of a template's stored geometry,
+// for the sandbox-only Mirror test screen (proves the engine reproduces the
+// source format exactly). Optional client_name_swap demonstrates that content
+// can differ while the format stays byte-identical. No LLM. Output lands in the
+// existing format_draft_exports bucket under a mirror-test/ prefix.
+app.post('/format-mirror-render', requireAuth, async (req, res) => {
+  try {
+    const { template_id, client_name_swap } = req.body || {};
+    if (!template_id) return res.status(400).json({ error: 'template_id is required' });
+
+    const db = createClient(req.authEnv.url, req.authEnv.serviceRoleKey);
+    const { data: tpl } = await db
+      .from('format_templates')
+      .select('name, format_geometry')
+      .eq('id', template_id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (!tpl) return res.status(404).json({ error: 'Template not found or access denied', code: 'NOT_FOUND' });
+
+    const geometry = tpl.format_geometry || {};
+    if (!geometry.structure) {
+      return res.status(422).json({ error: 'This template has no geometry yet — run /format-extract-v2 first.', code: 'NO_GEOMETRY' });
+    }
+
+    // Hydrate media bytes from storage (renderer needs Buffers keyed by rel_id).
+    for (const m of geometry.media || []) {
+      if (!m.storage_path) continue;
+      try {
+        const { data: blob, error } = await db.storage.from('format_template_media').download(m.storage_path);
+        if (error || !blob) { console.error('[/format-mirror-render] media download:', error && error.message); continue; }
+        m.bytes = Buffer.from(await blob.arrayBuffer());
+      } catch (e) {
+        console.error('[/format-mirror-render] media download threw:', e.message);
+      }
+    }
+
+    let textTransform;
+    if (client_name_swap && client_name_swap.from && client_name_swap.to) {
+      const from = String(client_name_swap.from);
+      const to = String(client_name_swap.to);
+      textTransform = (t) => (t && t.indexOf(from) !== -1 ? t.split(from).join(to) : t);
+    }
+
+    const buffer = await buildReportDocxV2({ geometry, textTransform });
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const safe = (s) => String(s).replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, ' ').trim();
+    const filename = `${safe(tpl.name || 'template')}_mirror_${dateStr}.docx`;
+    const objectPath = `${req.user.id}/mirror-test/${template_id}/${filename}`;
+
+    const { error: upErr } = await db.storage
+      .from('format_draft_exports')
+      .upload(objectPath, buffer, {
+        contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        upsert: true,
+      });
+    if (upErr) {
+      console.error('[/format-mirror-render] upload error:', upErr.message);
+      return res.status(500).json({ error: 'Failed to store the rendered file' });
+    }
+    const { data: signed, error: signErr } = await db.storage
+      .from('format_draft_exports')
+      .createSignedUrl(objectPath, 3600);
+    if (signErr || !signed) {
+      return res.status(500).json({ error: 'Rendered, but the download link could not be created' });
+    }
+
+    console.log('[/format-mirror-render] ' + JSON.stringify({
+      slp_id: req.user.id, template_id, bytes: buffer.length,
+    }));
+    return res.json({
+      signed_url: signed.signedUrl,
+      filename,
+      geometry_summary: {
+        page_setup: geometry.page_setup,
+        default_font: geometry.default_font,
+        counts: geometry.counts,
+        media: (geometry.media || []).map((m) => ({ id: m.id, anchor: m.anchor, wrap_mode: m.wrap_mode })),
+      },
+    });
+  } catch (err) {
+    console.error('[/format-mirror-render] error:', err.message, err.stack);
+    return res.status(500).json({ error: `Mirror render failed: ${err.message}` });
+  }
+});
+
 const generateGoals = require('./routes/generateGoals');
 app.use('/api', generateGoals);
 
