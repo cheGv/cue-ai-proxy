@@ -2417,6 +2417,8 @@ You output ONLY the JSON array. No prose, no markdown, no commentary. The output
   }
 ]`;
 
+const { FORMAT_DRAFT_SLOT_ADDENDUM } = require('./lib/draftSlotAddendum');
+
 app.post('/format-draft', requireAuth, async (req, res) => {
   try {
     const { template_id, client_id, date_range, locked_template, lexicon_defaults, canonical_data } = req.body || {};
@@ -2433,17 +2435,51 @@ app.post('/format-draft', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'canonical_data (object) is required' });
     }
 
+    // Phase D wk3 — the proxy reads the template's server-managed slot map by
+    // template_id; slot-fill mode activates only when a non-empty slot map
+    // exists. The Flutter generate-report call is UNCHANGED — it never has to
+    // know about slot maps (E2). One db client is reused for read + persistence.
+    const db = createClient(req.authEnv.url, req.authEnv.serviceRoleKey);
+    let slotMap = null;
+    {
+      const { data: tplRow } = await db
+        .from('format_templates')
+        .select('format_slot_map')
+        .eq('id', template_id)
+        .eq('user_id', req.user.id)
+        .maybeSingle();
+      const sm = tplRow && tplRow.format_slot_map;
+      if (sm && Array.isArray(sm.slots) && sm.slots.length > 0) slotMap = sm;
+    }
+    const slotFill = !!slotMap;
+
     const userPayload = {
       date_range: date_range || null,
       locked_template,
       lexicon_defaults: Array.isArray(lexicon_defaults) ? lexicon_defaults : [],
       canonical_data,
     };
-    const userText =
-      'Draft the report now. Map the canonical clinical data into the locked format template, ' +
-      'section by section, in the template’s order, following every rule in your instructions.\n\n' +
-      'INPUT:\n' + JSON.stringify(userPayload) + '\n\n' +
-      'Output ONLY the JSON array of section objects.';
+    if (slotFill) {
+      // The LLM needs only the semantic slot list, not geometry locations.
+      userPayload.slot_map = {
+        slots: slotMap.slots.map((s) => ({
+          slot_id: s.slot_id,
+          semantic_label: s.semantic_label,
+          repeatable_per_skill_domain: s.repeatable_per_skill_domain,
+          notes: s.notes,
+        })),
+      };
+    }
+    const userText = slotFill
+      ? ('Draft the report now. Map the canonical clinical data into the locked format template, ' +
+         'section by section, in the template’s order, AND fill the slot_map per the slot-fill rules. ' +
+         'Follow every rule in your instructions.\n\n' +
+         'INPUT:\n' + JSON.stringify(userPayload) + '\n\n' +
+         'Output ONLY the JSON object with keys "sections" and "slot_content".')
+      : ('Draft the report now. Map the canonical clinical data into the locked format template, ' +
+         'section by section, in the template’s order, following every rule in your instructions.\n\n' +
+         'INPUT:\n' + JSON.stringify(userPayload) + '\n\n' +
+         'Output ONLY the JSON array of section objects.');
 
     const startedAt = Date.now();
     let data;
@@ -2458,13 +2494,14 @@ app.post('/format-draft', requireAuth, async (req, res) => {
         body: JSON.stringify({
           model:      'claude-opus-4-5',
           max_tokens: 16384,
-          system: [
-            {
-              type: 'text',
-              text: FORMAT_DRAFT_SYSTEM_PROMPT,
-              cache_control: { type: 'ephemeral' },
-            },
-          ],
+          system: slotFill
+            ? [
+                { type: 'text', text: FORMAT_DRAFT_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
+                { type: 'text', text: FORMAT_DRAFT_SLOT_ADDENDUM, cache_control: { type: 'ephemeral' } },
+              ]
+            : [
+                { type: 'text', text: FORMAT_DRAFT_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
+              ],
           messages: [{ role: 'user', content: userText }],
         }),
       });
@@ -2483,9 +2520,9 @@ app.post('/format-draft', requireAuth, async (req, res) => {
     const latencyMs = Date.now() - startedAt;
 
     const text = _firstTextBlock(data);
-    let draftSections;
+    let parsed;
     try {
-      draftSections = JSON.parse(stripJsonFence(text));
+      parsed = JSON.parse(stripJsonFence(text));
     } catch (e) {
       console.error('[/format-draft] JSON parse failed; raw head:', text.slice(0, 400));
       return res.status(502).json({
@@ -2493,8 +2530,20 @@ app.post('/format-draft', requireAuth, async (req, res) => {
         code:  'PARSE_ERROR',
       });
     }
+    // Slot-fill mode returns { sections, slot_content }; legacy mode returns a
+    // bare section array. Normalise both into draftSections + slotContent.
+    let draftSections;
+    let slotContent = {};
+    if (slotFill && parsed && !Array.isArray(parsed) && Array.isArray(parsed.sections)) {
+      draftSections = parsed.sections;
+      slotContent = (parsed.slot_content && typeof parsed.slot_content === 'object' && !Array.isArray(parsed.slot_content))
+        ? parsed.slot_content
+        : {};
+    } else {
+      draftSections = parsed;
+    }
     if (!Array.isArray(draftSections)) {
-      console.error('[/format-draft] model did not return an array; type:', typeof draftSections);
+      console.error('[/format-draft] model did not return a sections array; type:', typeof draftSections);
       return res.status(502).json({
         error: 'The draft did not come back as a list of sections. Please try generating again.',
         code:  'SCHEMA_INVALID',
@@ -2520,7 +2569,7 @@ app.post('/format-draft', requireAuth, async (req, res) => {
     // The proxy is the single authoritative writer. INSERT the draft row, then
     // split each section into sentences and INSERT the corpus rows. On sentence
     // failure we delete the draft (FK CASCADE) so no orphan draft is returned.
-    const db = createClient(req.authEnv.url, req.authEnv.serviceRoleKey);
+    // (db client created above, reused here.)
     const dr = date_range || {};
     const { data: draftRow, error: draftErr } = await db
       .from('format_drafts')
@@ -2532,6 +2581,7 @@ app.post('/format-draft', requireAuth, async (req, res) => {
         date_range_start:    dr.start  || null,
         date_range_end:      dr.end    || null,
         draft_sections:      draftSections,
+        slot_content:        slotContent,
         generation_metadata: generationMetadata,
         status:              'draft',
       })
@@ -2647,7 +2697,7 @@ app.post('/format-draft-export', requireAuth, async (req, res) => {
     // Load the draft — ownership-scoped even under the service-role client.
     const { data: draft, error: draftErr } = await db
       .from('format_drafts')
-      .select('id, user_id, client_id, template_id, draft_sections, generation_metadata')
+      .select('id, user_id, client_id, template_id, draft_sections, slot_content, generation_metadata')
       .eq('id', draft_id)
       .eq('user_id', req.user.id)
       .maybeSingle();
@@ -2662,7 +2712,7 @@ app.post('/format-draft-export', requireAuth, async (req, res) => {
     // Load the locked template (format_name + per-section length conventions).
     const { data: template } = await db
       .from('format_templates')
-      .select('name, extracted_template')
+      .select('name, extracted_template, format_geometry, format_slot_map')
       .eq('id', draft.template_id)
       .eq('user_id', req.user.id)
       .maybeSingle();
@@ -2683,13 +2733,41 @@ app.post('/format-draft-export', requireAuth, async (req, res) => {
       'Report';
     const clientName = (client && client.name && String(client.name).trim()) || 'Client';
 
-    // Render the .docx (review markers/swaps stripped; placeholders highlighted).
-    const buffer = await buildReportDocx({
-      formatName,
-      clientName,
-      draftSections: draft.draft_sections,
-      extractedTemplate,
-    });
+    // Phase D wk3 — content-fill MIRROR when the template has geometry + a slot
+    // map AND the draft carries slot_content; otherwise fall back to the V1
+    // renderer with a clear warning (D3). The path is logged + returned for the
+    // sandbox debug indicator. A V2 render error is NOT swallowed — it
+    // propagates to the outer catch and surfaces as a 500 with the real message.
+    const geometry = (template && template.format_geometry) || {};
+    const slotMap = (template && template.format_slot_map) || {};
+    const slotContent = draft.slot_content || {};
+    const hasGeometry = Array.isArray(geometry.structure) && geometry.structure.length > 0;
+    const hasSlots = slotMap && Array.isArray(slotMap.slots) && slotMap.slots.length > 0;
+    const hasContent = slotContent && typeof slotContent === 'object' && Object.keys(slotContent).length > 0;
+
+    let buffer;
+    let renderPath;
+    let warning = null;
+    if (hasGeometry && hasSlots && hasContent) {
+      // Hydrate media bytes from the private bucket so images render.
+      for (const m of geometry.media || []) {
+        if (!m.storage_path) continue;
+        const { data: blob, error: dlErr } = await db.storage.from('format_template_media').download(m.storage_path);
+        if (dlErr || !blob) { console.error('[/format-draft-export] media download:', dlErr && dlErr.message); continue; }
+        m.bytes = Buffer.from(await blob.arrayBuffer());
+      }
+      buffer = await buildReportDocxV2({ geometry, slotMap, contentMap: slotContent });
+      renderPath = 'v2_content_fill';
+    } else {
+      buffer = await buildReportDocx({
+        formatName,
+        clientName,
+        draftSections: draft.draft_sections,
+        extractedTemplate,
+      });
+      renderPath = !hasGeometry ? 'v1_no_geometry' : (!hasSlots ? 'v1_no_slots' : 'v1_no_content');
+      warning = 'This template was created before exact-format mirroring was supported. Re-upload the template to enable content-fill into your original format.';
+    }
 
     // Filename: {client}_{format}_{date}.docx, filesystem-safe.
     const dateStr = new Date().toISOString().slice(0, 10);
@@ -2728,10 +2806,10 @@ app.post('/format-draft-export', requireAuth, async (req, res) => {
     }
 
     console.log('[/format-draft-export] ' + JSON.stringify({
-      slp_id: req.user.id, draft_id: draft.id, bytes: buffer.length, path: objectPath,
+      slp_id: req.user.id, draft_id: draft.id, bytes: buffer.length, path: objectPath, render_path: renderPath,
     }));
 
-    return res.json({ signed_url: signed.signedUrl, filename });
+    return res.json({ signed_url: signed.signedUrl, filename, render_path: renderPath, warning });
   } catch (err) {
     console.error('[/format-draft-export] error:', err.message, err.stack);
     return res.status(500).json({ error: `Export failed: ${err.message}` });
@@ -2936,6 +3014,78 @@ app.post('/format-mirror-render', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('[/format-mirror-render] error:', err.message, err.stack);
     return res.status(500).json({ error: `Mirror render failed: ${err.message}` });
+  }
+});
+
+// ── Phase D week 3 — Cue Mirror content-slot bridge ───────────────────────────
+// /format-identify-slots runs LLM-aided slot identification over a template's
+// stored geometry and writes format_slot_map. The empty default '{}' means
+// "not yet identified" — the renderer falls back to V1. On any error the
+// real message is surfaced (NEVER swallowed) AND format_slot_map is left '{}', so
+// a template is only marked "ready for content-fill" when slots truly resolved.
+const { identifySlots } = require('./lib/identifySlots');
+
+app.post('/format-identify-slots', requireAuth, async (req, res) => {
+  try {
+    const { template_id } = req.body || {};
+    if (!template_id) return res.status(400).json({ error: 'template_id is required' });
+
+    const db = createClient(req.authEnv.url, req.authEnv.serviceRoleKey);
+    const { data: tpl, error: tplErr } = await db
+      .from('format_templates')
+      .select('format_geometry')
+      .eq('id', template_id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (tplErr) {
+      console.error('[/format-identify-slots] template load error:', tplErr.message);
+      return res.status(500).json({ error: 'Failed to load template' });
+    }
+    if (!tpl) return res.status(404).json({ error: 'Template not found or access denied', code: 'NOT_FOUND' });
+
+    const geometry = tpl.format_geometry || {};
+    if (!Array.isArray(geometry.structure) || geometry.structure.length === 0) {
+      return res.status(422).json({ error: 'This template has no geometry yet — run /format-extract-v2 first.', code: 'NO_GEOMETRY' });
+    }
+
+    let slotMap;
+    try {
+      slotMap = await identifySlots(geometry, { apiKey: ANTHROPIC_API_KEY });
+    } catch (e) {
+      // Surface the real error; leave format_slot_map='{}' so the template is
+      // NOT marked ready — the renderer falls back to V1 (no silent catch).
+      console.error('[/format-identify-slots] identification failed:', e.message);
+      return res.status(502).json({ error: `Slot identification failed: ${e.message}`, code: 'SLOT_ID_FAILED' });
+    }
+
+    const { data, error } = await db
+      .from('format_templates')
+      .update({ format_slot_map: slotMap, updated_at: new Date().toISOString() })
+      .eq('id', template_id)
+      .eq('user_id', req.user.id)
+      .select('id')
+      .maybeSingle();
+    if (error) {
+      console.error('[/format-identify-slots] store error:', error.message);
+      return res.status(500).json({ error: 'Failed to store slot map' });
+    }
+    if (!data) return res.status(404).json({ error: 'Template not found or access denied', code: 'NOT_FOUND' });
+
+    console.log('[/format-identify-slots] ' + JSON.stringify({
+      slp_id: req.user.id, template_id,
+      slots: slotMap.slots.length, repeatable: !!slotMap.repeatable_table, tokens: slotMap.usage,
+    }));
+    return res.json({
+      template_id,
+      slot_map: {
+        slot_count: slotMap.slots.length,
+        repeatable_table: slotMap.repeatable_table,
+        slots: slotMap.slots.map((s) => ({ slot_id: s.slot_id, semantic_label: s.semantic_label, repeatable: s.repeatable_per_skill_domain })),
+      },
+    });
+  } catch (err) {
+    console.error('[/format-identify-slots] error:', err.message, err.stack);
+    return res.status(500).json({ error: `Slot identification failed: ${err.message}` });
   }
 });
 
