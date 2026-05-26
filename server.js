@@ -2756,7 +2756,7 @@ app.post('/format-draft-export', requireAuth, async (req, res) => {
         if (dlErr || !blob) { console.error('[/format-draft-export] media download:', dlErr && dlErr.message); continue; }
         m.bytes = Buffer.from(await blob.arrayBuffer());
       }
-      buffer = await buildReportDocxV2({ geometry, slotMap, contentMap: slotContent });
+      buffer = await buildReportDocxV2({ geometry, slotMap, contentMap: slotContent, renderMode: 'content_fill' });
       renderPath = 'v2_content_fill';
     } else {
       buffer = await buildReportDocx({
@@ -2975,7 +2975,9 @@ app.post('/format-mirror-render', requireAuth, async (req, res) => {
       textTransform = (t) => (t && t.indexOf(from) !== -1 ? t.split(from).join(to) : t);
     }
 
-    const buffer = await buildReportDocxV2({ geometry, textTransform });
+    // Mirror debug screen reproduces the source EXACTLY (incl. clinical content)
+    // for format-fidelity testing — explicit opt-in to verbatim mode.
+    const buffer = await buildReportDocxV2({ geometry, textTransform, renderMode: 'verbatim' });
     const dateStr = new Date().toISOString().slice(0, 10);
     const safe = (s) => String(s).replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, ' ').trim();
     const filename = `${safe(tpl.name || 'template')}_mirror_${dateStr}.docx`;

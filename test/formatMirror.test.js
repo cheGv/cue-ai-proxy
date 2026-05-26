@@ -56,7 +56,8 @@ test('E1 PT — portrait, at least one image', { skip: PT ? false : 'PT fixture 
 // ── E2: extract → render → re-extract round-trip ─────────────────────────────
 async function roundTrip(fixturePath) {
   const src = await extractGeometry(fs.readFileSync(fixturePath));
-  const buf = await buildReportDocxV2({ geometry: src });
+  // verbatim mode = pure mirror reproduction (content_fill is the default now).
+  const buf = await buildReportDocxV2({ geometry: src, renderMode: 'verbatim' });
   const out = await extractGeometry(buf);
   return { src, out };
 }
@@ -114,7 +115,7 @@ test('smoke — minimal geometry renders to a non-empty .docx', async () => {
     ],
     media: [],
   };
-  const buf = await buildReportDocxV2({ geometry });
+  const buf = await buildReportDocxV2({ geometry, renderMode: 'verbatim' });
   assert.ok(Buffer.isBuffer(buf) && buf.length > 1000, 'produced a docx buffer');
   const out = await extractGeometry(buf);
   assert.strictEqual(out.page_setup.orientation, 'landscape');

@@ -51,7 +51,12 @@ function syntheticSlotMap() {
       { slot_id: 'row_skills', location: { block: 1, row: 2, cell: 1 }, semantic_label: 'skill_domain', repeatable_per_skill_domain: true, notes: '' },
       { slot_id: 'row_goals', location: { block: 1, row: 2, cell: 2 }, semantic_label: 'goal_statement', repeatable_per_skill_domain: true, notes: '' },
     ],
-    static_text: [],
+    static_text: [
+      { location: { block: 0 }, text: 'LESSON PLAN FORM' },
+      { location: { block: 1, row: 1, cell: 0 }, text: 'S.N' },
+      { location: { block: 1, row: 1, cell: 1 }, text: 'SKILLS' },
+      { location: { block: 1, row: 1, cell: 2 }, text: 'GOALS' },
+    ],
     repeatable_table: { block: 1, header_rows: [0, 1], template_row: 2 },
   };
 }
@@ -89,13 +94,65 @@ test('F3 renderer — content-fill injects slots, expands repeatable rows, prese
   assert.ok(txt.includes('LESSON PLAN FORM') && txt.includes('S.N') && txt.includes('SKILLS'));
 });
 
-test('F3b renderer — no slotMap ⇒ pure verbatim mirror (unchanged)', async () => {
+test('F3b renderer — verbatim mode ⇒ pure mirror (placeholders kept, no expansion)', async () => {
   const geometry = syntheticGeometry();
-  const buf = await buildReportDocxV2({ geometry });
+  const buf = await buildReportDocxV2({ geometry, renderMode: 'verbatim' });
   const out = await extractGeometry(buf);
   // verbatim: placeholders remain, body NOT expanded (still 3 rows)
   assert.strictEqual(firstTableRows(out), 3);
   assert.ok(allText(out).includes('skill placeholder'));
+});
+
+// ── F-leak: the render-mode safety boundary (synthetic, always runs) ──────────
+function leakGeometry() {
+  return {
+    page_setup: { width: 11909, height: 16834, orientation: 'portrait', margins: { top: 1440, bottom: 1440, left: 1440, right: 1440, header: 720, footer: 720 } },
+    default_font: { family: 'Times New Roman', size: 24 },
+    numbering_definitions: { abstract: {}, nums: {} },
+    media: [],
+    structure: [
+      para('PRE THERAPY ASSESSMENT'),               // 0 static heading
+      para('Case Name: OldClient'),                  // 1 slot client_name (replace)
+      para('Birth weight: 3.4 kg'),                  // 2 slot birth_weight (empty → label only)
+      para('II. History:'),                          // 3 static heading
+      para('Prenatal History: No significant hx'),   // 4 slot prenatal (empty → label only)
+      para('Stray prior-client note never classified'), // 5 UNCLASSIFIED → blank in content_fill
+    ],
+  };
+}
+const leakSlotMap = {
+  slots: [
+    { slot_id: 'client_name', location_type: 'paragraph', location: { block: 1 }, semantic_label: 'client_name', repeatable_per_skill_domain: false, notes: 'Label prefix: Case Name:' },
+    { slot_id: 'birth_weight', location_type: 'paragraph', location: { block: 2 }, semantic_label: 'birth_history', repeatable_per_skill_domain: false, notes: 'Label prefix: Birth weight:' },
+    { slot_id: 'prenatal_history', location_type: 'paragraph', location: { block: 4 }, semantic_label: 'prenatal_history', repeatable_per_skill_domain: false, notes: 'Label prefix: Prenatal History:' },
+  ],
+  static_text: [
+    { location: { block: 0 }, text: 'PRE THERAPY ASSESSMENT' },
+    { location: { block: 3 }, text: 'II. History:' },
+  ],
+  repeatable_table: null,
+};
+
+test('F-leak-1 content_fill — prior client clinical data NEVER leaks', async () => {
+  const contentMap = { client_name: 'NewKid', birth_weight: '', prenatal_history: '' };
+  const out = await extractGeometry(await buildReportDocxV2({ geometry: leakGeometry(), slotMap: leakSlotMap, contentMap, renderMode: 'content_fill' }));
+  const txt = allText(out);
+  // new client present; labels kept; static headings kept
+  assert.ok(txt.includes('NewKid'), 'new client name filled');
+  assert.ok(txt.includes('Case Name:') && txt.includes('Birth weight:') && txt.includes('Prenatal History:'), 'labels kept for empty slots');
+  assert.ok(txt.includes('PRE THERAPY ASSESSMENT') && txt.includes('II. History:'), 'static scaffolding kept');
+  // NONE of the prior client's clinical content survives
+  for (const leak of ['OldClient', '3.4 kg', 'No significant hx', 'Stray prior-client note']) {
+    assert.ok(!txt.includes(leak), `must NOT leak: "${leak}"`);
+  }
+});
+
+test('F-leak-2 verbatim — prior client content reproduced exactly (mirror path)', async () => {
+  const out = await extractGeometry(await buildReportDocxV2({ geometry: leakGeometry(), renderMode: 'verbatim' }));
+  const txt = allText(out);
+  for (const keep of ['OldClient', '3.4 kg', 'No significant hx', 'Stray prior-client note', 'PRE THERAPY ASSESSMENT']) {
+    assert.ok(txt.includes(keep), `verbatim must reproduce: "${keep}"`);
+  }
 });
 
 test('F1 identifySlots — parses LLM output into a slot map', async () => {
