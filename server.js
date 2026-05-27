@@ -2825,6 +2825,7 @@ app.post('/format-draft-export', requireAuth, async (req, res) => {
 // bytes. The env (sandbox/prod) is chosen by the token issuer (req.authEnv);
 // the app auths against sandbox, so this writes sandbox.
 const { extractGeometry } = require('./lib/extractGeometry');
+const { extractPDFGeometry } = require('./lib/extractPDFGeometry');
 const { buildReportDocxV2 } = require('./lib/buildReportDocxV2');
 
 function _mediaContentType(ext) {
@@ -2844,18 +2845,25 @@ app.post('/format-extract-v2', requireAuth, async (req, res) => {
     if (!Array.isArray(files) || files.length === 0) {
       return res.status(400).json({ error: 'files (non-empty array) is required' });
     }
-    // Geometry mirrors ONE primary document — the first .docx.
-    const docxFile = files.find((f) => (f.file_type || '').toLowerCase().includes('doc')) || files[0];
-    if (!docxFile || !docxFile.signed_url) {
-      return res.status(422).json({ error: 'A .docx source with a signed_url is required', code: 'NO_DOCX' });
+    // Geometry mirrors ONE primary document — prefer a .docx, else accept a PDF
+    // (Phase E: deterministic PDF-digital geometry via extractPDFGeometry). The
+    // selection + dispatch below are the ONLY format-aware code; both extractors
+    // return the identical canonical shape, so media upload, persistence and the
+    // response are shared verbatim.
+    const primaryFile =
+      files.find((f) => (f.file_type || '').toLowerCase().includes('doc')) ||
+      files.find((f) => (f.file_type || '').toLowerCase().includes('pdf')) ||
+      files[0];
+    if (!primaryFile || !primaryFile.signed_url) {
+      return res.status(422).json({ error: 'A .docx or .pdf source with a signed_url is required', code: 'NO_SOURCE' });
     }
-    if ((docxFile.file_type || '').toLowerCase() === 'pdf') {
-      return res.status(422).json({ error: 'Geometry mirroring requires a .docx (PDF has no recoverable OOXML geometry)', code: 'PDF_UNSUPPORTED' });
-    }
+    const isPdf =
+      (primaryFile.file_type || '').toLowerCase().includes('pdf') ||
+      /\.pdf(\?|$)/i.test(primaryFile.signed_url || '');
 
     let buf;
     try {
-      const r = await fetch(docxFile.signed_url);
+      const r = await fetch(primaryFile.signed_url);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       buf = Buffer.from(await r.arrayBuffer());
     } catch (e) {
@@ -2864,7 +2872,7 @@ app.post('/format-extract-v2', requireAuth, async (req, res) => {
 
     let geometry;
     try {
-      geometry = await extractGeometry(buf);
+      geometry = isPdf ? await extractPDFGeometry(buf) : await extractGeometry(buf);
     } catch (e) {
       console.error('[/format-extract-v2] parse failed:', e.message);
       return res.status(422).json({ error: `Could not parse document geometry: ${e.message}`, code: 'GEOMETRY_PARSE_FAILED' });
@@ -2878,18 +2886,26 @@ app.post('/format-extract-v2', requireAuth, async (req, res) => {
     for (let i = 0; i < geometry.media.length; i++) {
       const m = geometry.media[i];
       const objectPath = `${req.user.id}/${template_id}/${m.id || `image${i}.${m.ext}`}`;
-      const { error: upErr } = await db.storage
-        .from('format_template_media')
-        .upload(objectPath, m.bytes, { contentType: _mediaContentType(m.ext), upsert: true });
-      if (upErr) console.error('[/format-extract-v2] media upload error:', upErr.message);
+      let storagePath = objectPath;
+      if (m.bytes) {
+        const { error: upErr } = await db.storage
+          .from('format_template_media')
+          .upload(objectPath, m.bytes, { contentType: _mediaContentType(m.ext), upsert: true });
+        if (upErr) console.error('[/format-extract-v2] media upload error:', upErr.message);
+      } else {
+        // PDF path: anchor recovered but image bytes could not be re-encoded —
+        // keep the structural anchor, store no object (renderer skips it).
+        storagePath = null;
+      }
       storedMedia.push({
         id: m.id, rel_id: m.rel_id, part: m.part, ext: m.ext,
-        storage_path: objectPath, anchor: m.anchor, wrap_mode: m.wrap_mode,
+        storage_path: storagePath, anchor: m.anchor, wrap_mode: m.wrap_mode,
       });
     }
 
     const geometryToStore = {
-      engine: 'format-extract-v2',
+      engine: isPdf ? 'format-extract-pdf' : 'format-extract-v2',
+      source: geometry.source || (isPdf ? 'pdf' : 'docx'),
       extracted_at: new Date().toISOString(),
       page_setup: geometry.page_setup,
       default_font: geometry.default_font,

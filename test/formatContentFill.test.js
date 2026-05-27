@@ -173,7 +173,10 @@ test('F1 identifySlots — parses LLM output into a slot map', async () => {
   );
   assert.strictEqual(map.engine, 'format-identify-slots');
   assert.strictEqual(map.slots.length, 1);
-  assert.strictEqual(map.slots[0].slot_id, 'client_name');
+  // slot_id is recomputed deterministically from (semantic_label, position) —
+  // NOT the LLM's free-form value (Finding E-8). block 0 → "client_name_0".
+  assert.strictEqual(map.slots[0].slot_id, 'client_name_0');
+  assert.strictEqual(map.slots[0].semantic_label, 'client_name');
   assert.strictEqual(map.repeatable_table.template_row, 1);
 });
 

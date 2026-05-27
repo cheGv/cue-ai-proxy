@@ -1,0 +1,304 @@
+// test/extractPDFGeometry.test.js
+//
+// Phase E week 1 — PDF-digital geometry extractor. Deterministic unit tests of
+// the PURE inference helpers (no pdfjs, no real PDF, no API key — always run).
+// The full end-to-end parse of a real Word-exported PDF is exercised in the
+// Part C ingestion test against vrishin PT.pdf.
+
+const { test } = require('node:test');
+const assert = require('node:assert');
+const { _internals, extractPDFGeometry } = require('../lib/extractPDFGeometry');
+
+const {
+  matMul, applyMatrix, ptToDxa, ptToEmu,
+  cleanFontFamily, fontIsBold, fontIsItalic, clusterPositions,
+  buildLineRuns, groupGlyphsIntoLines, detectAlignment, indentLeftDxa,
+  linesToParagraphs, pushSeg, collectPathSegments, detectTablesFromSegments,
+  mergeSliverColumns, refineTableDescs,
+  indexForBoundary, buildTableBlock, imageAnchorFromCtm, encodePng,
+  inferContentArea, buildPageSetup, buildDefaultFont, finalizeBlocks,
+} = _internals;
+
+// A synthetic glyph in the extractor's internal shape (top-down points).
+function glyph(str, xLeft, width, baseTop, size, opts = {}) {
+  return {
+    str,
+    xLeft,
+    xRight: xLeft + width,
+    baseTop,
+    top: baseTop - size * 0.8,
+    bottom: baseTop + size * 0.2,
+    size,
+    sizeHp: Math.max(1, Math.round(size * 2)),
+    font: opts.font || 'Arial',
+    bold: !!opts.bold,
+    italic: !!opts.italic,
+  };
+}
+
+// ── units ─────────────────────────────────────────────────────────────────────
+test('unit conversion: points → DXA (×20) and EMU (×12700)', () => {
+  assert.equal(ptToDxa(72), 1440); // 1 inch
+  assert.equal(ptToEmu(72), 914400); // 1 inch
+  assert.equal(ptToDxa(0), 0);
+  assert.equal(ptToEmu(11), 139700);
+});
+
+// ── matrices ────────────────────────────────────────────────────────────────
+test('applyMatrix: identity, translate, scale', () => {
+  assert.deepEqual(applyMatrix([1, 0, 0, 1, 0, 0], 3, 4), [3, 4]);
+  assert.deepEqual(applyMatrix([1, 0, 0, 1, 10, 20], 3, 4), [13, 24]);
+  assert.deepEqual(applyMatrix([2, 0, 0, 3, 0, 0], 3, 4), [6, 12]);
+});
+
+test('matMul: applies m1 first then m2 (scale then translate)', () => {
+  const scale = [2, 0, 0, 2, 0, 0];
+  const translate = [1, 0, 0, 1, 5, 5];
+  const combined = matMul(scale, translate); // scale a point, then translate
+  assert.deepEqual(applyMatrix(combined, 1, 1), [7, 7]); // (1,1)→(2,2)→(7,7)
+});
+
+// ── fonts ─────────────────────────────────────────────────────────────────────
+test('cleanFontFamily strips subset tag + style suffix', () => {
+  assert.equal(cleanFontFamily('ABCDEE+Arial-BoldMT'), 'Arial');
+  assert.equal(cleanFontFamily('BCDFGH+Calibri'), 'Calibri');
+  assert.equal(cleanFontFamily('ArialMT'), 'Arial');
+  assert.equal(cleanFontFamily('TimesNewRomanPS-ItalicMT'), 'Times New Roman'); // PS→friendly (E-3)
+  assert.equal(cleanFontFamily('TimesNewRomanPSMT'), 'Times New Roman');
+  assert.equal(cleanFontFamily(''), null);
+});
+
+test('font flag detection from PostScript names', () => {
+  assert.equal(fontIsBold('ABCDEE+Arial-BoldMT'), true);
+  assert.equal(fontIsBold('Arial-Black'), true);
+  assert.equal(fontIsBold('Arial', { fontWeight: 700 }), true);
+  assert.equal(fontIsBold('ArialMT'), false);
+  assert.equal(fontIsItalic('Times-Italic'), true);
+  assert.equal(fontIsItalic('Calibri-Oblique'), true);
+  assert.equal(fontIsItalic('ArialMT'), false);
+});
+
+// ── clustering ────────────────────────────────────────────────────────────────
+test('clusterPositions merges near values, returns means', () => {
+  const c = clusterPositions([100, 100.5, 101, 300, 301, 700], 2.5);
+  assert.equal(c.length, 3);
+  assert.ok(Math.abs(c[0] - 100.5) < 0.6);
+  assert.ok(Math.abs(c[1] - 300.5) < 0.6);
+  assert.equal(c[2], 700);
+});
+
+// ── glyph → line → runs ─────────────────────────────────────────────────────
+test('buildLineRuns: split runs on style change, insert space across a gap', () => {
+  // "Name:" (bold) then a wide gap then "Asha" (regular)
+  const line = buildLineRuns([
+    glyph('Name:', 72, 30, 100, 11, { bold: true }),
+    glyph('Asha', 140, 25, 100, 11), // gap 140-102=38 ≫ 0.25*11
+  ]);
+  assert.equal(line.runs.length, 2);
+  assert.equal(line.runs[0].bold, true);
+  assert.equal(line.runs[0].size, 22); // 11pt → 22 half-points
+  assert.equal(line.text, 'Name: Asha');
+  assert.equal(line.runs[1].bold, undefined);
+});
+
+test('groupGlyphsIntoLines: two baselines → two lines, kept top→bottom', () => {
+  const lines = groupGlyphsIntoLines([
+    glyph('second', 72, 40, 130, 11),
+    glyph('first', 72, 40, 100, 11),
+  ]);
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0].text, 'first');
+  assert.equal(lines[1].text, 'second');
+  assert.ok(Array.isArray(lines[0].glyphs)); // glyphs retained for table splitting
+});
+
+// ── alignment + indent ──────────────────────────────────────────────────────
+test('detectAlignment: centered title vs left body', () => {
+  const pageW = 595; // A4 pt
+  const center = { xLeft: 240, xRight: 355 }; // midpoint ≈ 297 ≈ pageW/2
+  assert.equal(detectAlignment(center, pageW, 72, 72), 'center');
+  const left = { xLeft: 72, xRight: 200 };
+  assert.equal(detectAlignment(left, pageW, 72, 72), undefined);
+});
+
+test('indentLeftDxa: ignores sub-6pt jitter, converts real indent', () => {
+  assert.equal(indentLeftDxa({ xLeft: 75 }, 72), 0); // 3pt → ignore
+  assert.equal(indentLeftDxa({ xLeft: 108 }, 72), 720); // 36pt → 720 DXA
+});
+
+// ── paragraph grouping ──────────────────────────────────────────────────────
+test('linesToParagraphs: one block per short line (field-per-line template)', () => {
+  const mk = (text, baseTop) => Object.assign(
+    { baseTop }, buildLineRuns([glyph(text, 72, 60, baseTop, 11)]),
+  );
+  const blocks = linesToParagraphs([mk('Birth weight: 3.4 kg', 100), mk('Sucking: Achieved', 120)], 595, 72, 72);
+  assert.equal(blocks.length, 2);
+  assert.equal(blocks[0].type, 'paragraph');
+});
+
+test('linesToParagraphs: wrapped continuation folds into one block', () => {
+  // A near-full-width first line, then a tight same-indent second line.
+  const full = Object.assign({ baseTop: 100 }, buildLineRuns([glyph('x'.repeat(80), 72, 450, 100, 11)]));
+  const cont = Object.assign({ baseTop: 113 }, buildLineRuns([glyph('continues here', 72, 70, 113, 11)]));
+  const blocks = linesToParagraphs([full, cont], 595, 72, 72);
+  assert.equal(blocks.length, 1);
+  assert.ok(blocks[0].runs.length >= 2);
+});
+
+// ── segments ──────────────────────────────────────────────────────────────────
+test('pushSeg classifies axis-aligned segments, drops diagonals', () => {
+  const segs = [];
+  pushSeg(segs, 10, 50, 200, 50); // horizontal
+  pushSeg(segs, 10, 50, 10, 300); // vertical
+  pushSeg(segs, 10, 50, 200, 300); // diagonal → dropped
+  assert.equal(segs.length, 2);
+  assert.equal(segs[0].horizontal, true);
+  assert.equal(segs[1].vertical, true);
+});
+
+test('collectPathSegments: a rectangle becomes 4 edges under CTM', () => {
+  const OPS = { moveTo: 1, lineTo: 2, curveTo: 3, curveTo2: 4, curveTo3: 5, rectangle: 6, closePath: 7 };
+  const segs = [];
+  // rectangle at (100,600) w=200 h=20 in PDF coords; identity CTM; page H=792
+  collectPathSegments([[OPS.rectangle], [100, 600, 200, 20]], [1, 0, 0, 1, 0, 0], 792, segs, OPS);
+  const H = segs.filter((s) => s.horizontal);
+  const V = segs.filter((s) => s.vertical);
+  assert.equal(H.length, 2);
+  assert.equal(V.length, 2);
+});
+
+// ── table detection ─────────────────────────────────────────────────────────
+test('detectTablesFromSegments: a 2×2 grid yields 3 row + 3 col boundaries', () => {
+  const segs = [];
+  // 3 horizontal rules at y = 100,130,160 spanning x 72..272
+  for (const y of [100, 130, 160]) segs.push({ horizontal: true, y, x1: 72, x2: 272, len: 200 });
+  // 3 vertical rules at x = 72,172,272 spanning y 100..160
+  for (const x of [72, 172, 272]) segs.push({ vertical: true, x, y1: 100, y2: 160, len: 60 });
+  const tables = detectTablesFromSegments(segs);
+  assert.equal(tables.length, 1);
+  assert.equal(tables[0].rowYs.length, 3); // 2 rows
+  assert.equal(tables[0].colXs.length, 3); // 2 cols
+});
+
+test('detectTablesFromSegments: stacked tables >140pt apart split into two', () => {
+  const segs = [];
+  for (const y of [100, 130]) segs.push({ horizontal: true, y, x1: 72, x2: 272, len: 200 });
+  for (const x of [72, 272]) segs.push({ vertical: true, x, y1: 100, y2: 130, len: 30 });
+  for (const y of [400, 430]) segs.push({ horizontal: true, y, x1: 72, x2: 472, len: 400 });
+  for (const x of [72, 472]) segs.push({ vertical: true, x, y1: 400, y2: 430, len: 30 });
+  const tables = detectTablesFromSegments(segs);
+  assert.equal(tables.length, 2);
+});
+
+test('indexForBoundary maps a value to its band', () => {
+  const b = [100, 130, 160];
+  assert.equal(indexForBoundary(b, 115), 0);
+  assert.equal(indexForBoundary(b, 145), 1);
+  assert.equal(indexForBoundary(b, 999), -1);
+});
+
+test('buildTableBlock: glyphs bucket into the right cells', () => {
+  const desc = { top: 100, bottom: 160, left: 72, right: 272, rowYs: [100, 130, 160], colXs: [72, 172, 272] };
+  // four cells: (NAME:|AGE:) over (Asha|6y)
+  const lines = groupGlyphsIntoLines([
+    glyph('NAME:', 80, 40, 118, 11),
+    glyph('AGE:', 180, 35, 118, 11),
+    glyph('Asha', 80, 30, 148, 11),
+    glyph('6y', 180, 20, 148, 11),
+  ]);
+  const tbl = buildTableBlock(desc, lines);
+  assert.equal(tbl.type, 'table');
+  assert.equal(tbl.grid.length, 2);
+  assert.equal(tbl.rows.length, 2);
+  const cellText = (r, c) => tbl.rows[r].cells[c].content.map((p) => (p.runs || []).map((x) => x.text).join('')).join('');
+  assert.equal(cellText(0, 0), 'NAME:');
+  assert.equal(cellText(0, 1), 'AGE:');
+  assert.equal(cellText(1, 0), 'Asha');
+  assert.equal(cellText(1, 1), '6y');
+  assert.ok(tbl.borders.insideH); // drawn rules → single borders
+});
+
+// ── table-detection refinement (calibration) ─────────────────────────────────
+test('mergeSliverColumns: drops a too-narrow trailing column, keeps real ones', () => {
+  assert.deepEqual(mergeSliverColumns([0, 509, 586, 595]), [0, 509, 595]); // 9pt sliver → right edge
+  assert.deepEqual(mergeSliverColumns([0, 100, 200]), [0, 100, 200]); // all real → unchanged
+  assert.deepEqual(mergeSliverColumns([0, 5, 100, 200]), [0, 100, 200]); // leading 5pt sliver merged
+});
+
+test('refineTableDescs: drops single-column boxes and the page-1 header band', () => {
+  const oneCol = { top: 300, colXs: [0, 200], rowYs: [300, 320] };
+  const headerBand = { top: 10, colXs: [0, 100, 200, 300], rowYs: [10, 40] };
+  const body = { top: 300, colXs: [0, 100, 200, 300], rowYs: [300, 340] };
+  // page 0: single-col dropped, header-band dropped, body kept
+  const keptP0 = refineTableDescs([oneCol, headerBand, body], 0);
+  assert.equal(keptP0.length, 1);
+  assert.equal(keptP0[0].colXs.length, 4); // body table survives with its columns
+  // page 1: header-band rule does NOT apply (only page 0)
+  const keptP1 = refineTableDescs([headerBand], 1);
+  assert.equal(keptP1.length, 1);
+});
+
+// ── image anchor + encode ─────────────────────────────────────────────────────
+test('imageAnchorFromCtm: scale+translate → EMU anchor (top-down)', () => {
+  // image 100pt wide, 50pt tall, drawn with bottom-left at (200,700) on a 792pt page
+  const anchor = imageAnchorFromCtm([100, 0, 0, 50, 200, 700], 792);
+  assert.equal(anchor.width, ptToEmu(100));
+  assert.equal(anchor.height, ptToEmu(50));
+  assert.equal(anchor.x, ptToEmu(200));
+  assert.equal(anchor.y, ptToEmu(792 - 750)); // top-down top = 792 - (700+50)
+});
+
+test('encodePng: RGB bitmap re-encodes to a valid PNG buffer', () => {
+  // 2×1 RGB: red, green
+  const data = Uint8Array.from([255, 0, 0, 0, 255, 0]);
+  const buf = encodePng({ data, width: 2, height: 1, kind: 2 });
+  assert.ok(Buffer.isBuffer(buf));
+  // PNG signature
+  assert.deepEqual([...buf.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
+  assert.equal(encodePng({ data: null, width: 0, height: 0, kind: 2 }), null);
+});
+
+// ── page setup + stats ────────────────────────────────────────────────────────
+test('buildPageSetup: A4 portrait, margins from text extents only', () => {
+  const glyphs = [glyph('top-left', 72, 80, 80, 11), glyph('bottom', 72, 80, 760, 11)];
+  const ps = buildPageSetup(glyphs, 595, 842); // A4 pt
+  assert.equal(ps.orientation, 'portrait');
+  assert.equal(ps.width, ptToDxa(595));
+  assert.ok(ps.margins.left > 0 && ps.margins.top > 0);
+});
+
+test('buildDefaultFont: returns the modal family + size (by glyph weight)', () => {
+  const df = buildDefaultFont([
+    glyph('aaaaaa', 0, 10, 0, 11),
+    glyph('bbbbbb', 0, 10, 20, 11),
+    glyph('X', 0, 10, 40, 18, { font: 'Heading' }),
+  ]);
+  assert.equal(df.family, 'Arial');
+  assert.equal(df.size, 22);
+});
+
+test('inferContentArea: bounding box over glyphs', () => {
+  const a = inferContentArea([glyph('a', 72, 50, 100, 11), glyph('b', 200, 50, 300, 11)], 595, 842);
+  assert.equal(a.left, 72);
+  assert.equal(a.right, 250);
+});
+
+// ── finalize ──────────────────────────────────────────────────────────────────
+test('finalizeBlocks: adds _bbox + _inferred, spacing.after, strips temps', () => {
+  const structure = [
+    { type: 'paragraph', runs: [{ text: 'A' }], images: [], _top: 100, _bottom: 111, _xLeft: 72, _xRight: 120, _lineHeight: 11, _sortTop: 100 },
+    { type: 'paragraph', runs: [{ text: 'B' }], images: [], _top: 160, _bottom: 171, _xLeft: 72, _xRight: 120, _lineHeight: 11, _sortTop: 160 },
+  ];
+  finalizeBlocks(structure);
+  assert.equal(structure[0]._inferred, true);
+  assert.ok(structure[0]._bbox && typeof structure[0]._bbox.x === 'number');
+  assert.ok(structure[0].spacing && structure[0].spacing.after > 0); // gap 160-111 ≫ leading
+  assert.equal(structure[0]._top, undefined); // temp stripped
+  assert.equal(structure[1].spacing, undefined); // last block: no next → no spacing
+});
+
+// ── export surface ────────────────────────────────────────────────────────────
+test('extractPDFGeometry is exported as an async function', () => {
+  assert.equal(typeof extractPDFGeometry, 'function');
+  assert.equal(extractPDFGeometry.constructor.name, 'AsyncFunction');
+});
