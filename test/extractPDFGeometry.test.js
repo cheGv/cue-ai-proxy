@@ -17,6 +17,7 @@ const {
   mergeSliverColumns, refineTableDescs,
   indexForBoundary, buildTableBlock, imageAnchorFromCtm, encodePng,
   inferContentArea, buildPageSetup, buildDefaultFont, finalizeBlocks,
+  isCellEmpty, computeTableOccupancy, MIN_TABLE_OCCUPANCY,
 } = _internals;
 
 // A synthetic glyph in the extractor's internal shape (top-down points).
@@ -323,6 +324,88 @@ test('refineTableDescs: drops single-column boxes and the page-1 header band', (
   // page 1: header-band rule does NOT apply (only page 0)
   const keptP1 = refineTableDescs([headerBand], 1);
   assert.equal(keptP1.length, 1);
+});
+
+// ── E-15: content-occupancy test for detected tables ────────────────────────
+// A grid built from rules is a table only if a meaningful fraction of its
+// cells contain text glyphs. Empty grids are decorative artifacts. The
+// occupancy test happens AFTER buildTableBlock (which is the easy
+// post-bucketing inspection point); below threshold → descriptor discarded,
+// regionLines flow to linesToParagraphs.
+
+// Tiny helper to synthesize a table block with selective cell content.
+function synthTable(rows, cols, fillFn) {
+  return {
+    type: 'table',
+    grid: Array.from({ length: cols }, () => 1000),
+    rows: Array.from({ length: rows }, (_, r) => ({
+      cells: Array.from({ length: cols }, (_, c) => {
+        const t = fillFn(r, c);
+        return {
+          content: [{ type: 'paragraph', runs: t ? [{ text: t }] : [], images: [] }],
+          width: 1000,
+        };
+      }),
+    })),
+  };
+}
+
+test('E-15 isCellEmpty: detects empty runs vs whitespace vs real text', () => {
+  assert.equal(isCellEmpty({ content: [{ type: 'paragraph', runs: [] }] }), true);
+  assert.equal(isCellEmpty({ content: [{ type: 'paragraph', runs: [{ text: '' }] }] }), true);
+  assert.equal(isCellEmpty({ content: [{ type: 'paragraph', runs: [{ text: '   ' }] }] }), true);
+  assert.equal(isCellEmpty({ content: [{ type: 'paragraph', runs: [{ text: 'x' }] }] }), false);
+  assert.equal(isCellEmpty({}), true); // missing content
+});
+
+test('E-15 computeTableOccupancy: ratio across all cells', () => {
+  // All-filled 3×3 → 1.0
+  assert.equal(computeTableOccupancy(synthTable(3, 3, () => 'x')), 1);
+  // All-empty 3×3 → 0
+  assert.equal(computeTableOccupancy(synthTable(3, 3, () => null)), 0);
+  // 1 of 9 filled → ~0.111
+  const t = synthTable(3, 3, (r, c) => (r === 0 && c === 0) ? 'x' : null);
+  const occ = computeTableOccupancy(t);
+  assert.ok(Math.abs(occ - 1 / 9) < 1e-9, `occ=${occ}`);
+});
+
+test('E-15 phantom-grid rejection: 37×13 grid with ~30 filled (Ikansh b3 shape) → BELOW threshold', () => {
+  // Ikansh's worst false table was 37 rows × 13 cols (481 cells) with ~30
+  // cells filled (~6.2% occupancy). Threshold is 0.08, so this must reject.
+  // Distribute 30 fills evenly so the test is shape-equivalent, not data-equivalent.
+  let placed = 0;
+  const tbl = synthTable(37, 13, () => {
+    if (placed < 30) { placed++; return 'x'; }
+    return null;
+  });
+  const occ = computeTableOccupancy(tbl);
+  assert.ok(occ < MIN_TABLE_OCCUPANCY,
+    `occupancy=${(occ * 100).toFixed(2)}% should be below threshold ${MIN_TABLE_OCCUPANCY * 100}%`);
+});
+
+test('E-15 real-table acceptance: 10×3 grid with 10 filled (Vrishin test-material shape) → ABOVE threshold', () => {
+  // Vrishin test-material is 10 rows × 3 cols (30 cells) with ~10 filled
+  // in the middle column (~33% occupancy). Must be kept.
+  const tbl = synthTable(10, 3, (r, c) => c === 1 ? `row ${r}` : null);
+  const occ = computeTableOccupancy(tbl);
+  assert.ok(occ >= MIN_TABLE_OCCUPANCY,
+    `occupancy=${(occ * 100).toFixed(2)}% should be above threshold ${MIN_TABLE_OCCUPANCY * 100}%`);
+});
+
+test('E-15 real-table acceptance: 2×2 header+data (Vrishin linguistic shape) → ABOVE threshold', () => {
+  // Vrishin linguistic table (post-E-13): 2 rows × 4 cols with content in
+  // cells (header row: c1, c2; data row: c1, c2) → 4/8 = 50% occupancy.
+  const tbl = synthTable(2, 4, (r, c) => (c === 1 || c === 2) ? 'x' : null);
+  const occ = computeTableOccupancy(tbl);
+  assert.ok(occ >= MIN_TABLE_OCCUPANCY,
+    `occupancy=${(occ * 100).toFixed(2)}% should be above threshold ${MIN_TABLE_OCCUPANCY * 100}%`);
+});
+
+test('E-15 boundary: empty descriptor (no rows) defaults to occupancy=1 (no spurious reject)', () => {
+  // A zero-cell descriptor shouldn't be rejected by the occupancy test —
+  // refineTableDescs already drops nonsensical descriptors upstream.
+  assert.equal(computeTableOccupancy({ rows: [] }), 1);
+  assert.equal(computeTableOccupancy({}), 1);
 });
 
 // ── image anchor + encode ─────────────────────────────────────────────────────
