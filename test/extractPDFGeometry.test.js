@@ -190,6 +190,93 @@ test('detectTablesFromSegments: stacked tables >140pt apart split into two', () 
   assert.equal(tables.length, 2);
 });
 
+// E-13: a >140pt horizontal-rule gap with ≥2 vertical rules connecting prev
+// band's bottom to the next h-rule cluster is the empty interior of ONE table
+// (header rect + data rect sharing column rules), not a band split.
+test('detectTablesFromSegments: continuing vertical rules across the gap merge bands into one table (E-13)', () => {
+  const segs = [];
+  // header band: h-rules at y=100, 130 (small header row)
+  for (const y of [100, 130]) segs.push({ horizontal: true, y, x1: 72, x2: 272, len: 200 });
+  // box-bottom singleton h-rule at y=430 — gap 130→430 is 300pt, exceeds 140pt threshold
+  segs.push({ horizontal: true, y: 430, x1: 72, x2: 272, len: 200 });
+  // continuous left + right verticals span y=100..430 (across the gap)
+  for (const x of [72, 272]) segs.push({ vertical: true, x, y1: 100, y2: 430, len: 330 });
+  const tables = detectTablesFromSegments(segs);
+  assert.equal(tables.length, 1);
+  assert.equal(tables[0].rowYs.length, 3); // header top, header bottom, box bottom
+  assert.equal(tables[0].colXs.length, 2);
+});
+
+// E-13 threshold guard: a SINGLE connecting vertical rule is below the ≥2
+// threshold (could be a stray divider, not a table connection). Bands stay split.
+test('detectTablesFromSegments: a single connecting vertical rule does NOT merge bands (E-13 threshold)', () => {
+  const segs = [];
+  for (const y of [100, 130]) segs.push({ horizontal: true, y, x1: 72, x2: 272, len: 200 });
+  segs.push({ horizontal: true, y: 430, x1: 72, x2: 272, len: 200 });
+  // band-local header verticals (y1=100, y2=130) — do not connect to next h-cluster
+  for (const x of [72, 272]) segs.push({ vertical: true, x, y1: 100, y2: 130, len: 30 });
+  // ONLY ONE connecting vertical at x=170 spans the gap — below threshold
+  segs.push({ vertical: true, x: 170, y1: 100, y2: 430, len: 330 });
+  const tables = detectTablesFromSegments(segs);
+  // no merge → header band survives as a 1-row table; box-bottom singleton dropped (length=1)
+  assert.equal(tables.length, 1);
+  assert.equal(tables[0].rowYs.length, 2); // header band only
+});
+
+// E-13 SEAL guard: when an E-13 merge correctly extends the linguistic-style
+// band down to a singleton box-bottom, the next close h-rule (within the
+// 140pt small-gap branch) must NOT be absorbed into the same band — it belongs
+// to the next, physically-adjacent table. Vrishin failure mode: linguistic box
+// bottom at y=400 followed by test-material rule at y=420 (gap 20pt) was being
+// glued into the linguistic table, swallowing the next 11 rows.
+test('detectTablesFromSegments: small-gap rules past an E-13-confirmed bottom seal the band (E-13 seal)', () => {
+  const segs = [];
+  // table A — header h-rules at y=100, 130 + box-bottom singleton at y=400
+  for (const y of [100, 130]) segs.push({ horizontal: true, y, x1: 72, x2: 272, len: 200 });
+  segs.push({ horizontal: true, y: 400, x1: 72, x2: 272, len: 200 });
+  // table A header rect verticals
+  for (const x of [72, 272]) segs.push({ vertical: true, x, y1: 100, y2: 130, len: 30 });
+  // table A data rect verticals (y1≈prev band bottom, y2≈next h-cluster) — fire E-13
+  for (const x of [72, 272]) segs.push({ vertical: true, x, y1: 130, y2: 400, len: 270 });
+  // table B starts immediately below (small gap from 400 to 420) — UNRELATED table
+  for (const y of [420, 450, 480]) segs.push({ horizontal: true, y, x1: 50, x2: 300, len: 250 });
+  // table B verticals at different x positions (not part of table A's column set)
+  for (const x of [50, 300]) segs.push({ vertical: true, x, y1: 420, y2: 480, len: 60 });
+  const tables = detectTablesFromSegments(segs);
+  // Expected: 2 tables. Table A merged via E-13 (3 rules: 100, 130, 400).
+  // Table B is its own band (3 rules: 420, 450, 480) — NOT absorbed.
+  assert.equal(tables.length, 2);
+  assert.equal(tables[0].rowYs.length, 3); // table A: header + data row
+  assert.equal(tables[1].rowYs.length, 3); // table B: 2 data rows
+});
+
+// E-13 multi-section guard: a tall ruled table with MULTIPLE E-13 transitions
+// (header → mid-data row → bottom-data row, each section its own stroked
+// rectangle with verticals matching the section's top + bottom) must stay ONE
+// table. tableBottomY must UPDATE on each successive E-13 merge — the seal must
+// not fire prematurely while E-13 keeps confirming further-down extensions.
+test('detectTablesFromSegments: tall multi-section table with successive E-13 transitions stays one table (E-13 no premature seal)', () => {
+  const segs = [];
+  // h-rules at every section boundary: 100 (header top), 130 (header bottom),
+  // 400 (mid-data bottom), 700 (bottom-data bottom). Gaps: 30, 270, 300 — the
+  // two ≥140pt gaps trigger E-13 checks, both of which must merge.
+  for (const y of [100, 130, 400, 700]) segs.push({ horizontal: true, y, x1: 72, x2: 272, len: 200 });
+  // Header rect's left+right verticals (y=100..130)
+  for (const x of [72, 272]) segs.push({ vertical: true, x, y1: 100, y2: 130, len: 30 });
+  // Mid-data rect's verticals (y=130..400) — connect prev band's bottom (130)
+  // to next h-rule (400)
+  for (const x of [72, 272]) segs.push({ vertical: true, x, y1: 130, y2: 400, len: 270 });
+  // Bottom-data rect's verticals (y=400..700) — connect new prev bottom (400)
+  // to next h-rule (700)
+  for (const x of [72, 272]) segs.push({ vertical: true, x, y1: 400, y2: 700, len: 300 });
+  const tables = detectTablesFromSegments(segs);
+  // Expected: ONE table with 4 row boundaries → 3 rows (header + 2 data rows).
+  // If the seal fired prematurely after the first E-13 merge, we'd see 2+ tables.
+  assert.equal(tables.length, 1);
+  assert.equal(tables[0].rowYs.length, 4);
+  assert.equal(tables[0].colXs.length, 2);
+});
+
 test('indexForBoundary maps a value to its band', () => {
   const b = [100, 130, 160];
   assert.equal(indexForBoundary(b, 115), 0);
