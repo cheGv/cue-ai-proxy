@@ -2418,6 +2418,11 @@ You output ONLY the JSON array. No prose, no markdown, no commentary. The output
 ]`;
 
 const { FORMAT_DRAFT_SLOT_ADDENDUM } = require('./lib/draftSlotAddendum');
+const {
+  FORMAT_DRAFT_ASSESSMENT_ADDENDUM_VERSION,
+  FORMAT_DRAFT_ASSESSMENT_ADDENDUM_SHA256,
+  appendAssessmentAddendum,
+} = require('./lib/draftAssessmentAddendum');
 
 app.post('/format-draft', requireAuth, async (req, res) => {
   try {
@@ -2452,6 +2457,14 @@ app.post('/format-draft', requireAuth, async (req, res) => {
       if (sm && Array.isArray(sm.slots) && sm.slots.length > 0) slotMap = sm;
     }
     const slotFill = !!slotMap;
+    // Step 4 — assessment mode activates ONLY when canonical_data carries an
+    // `assessment` block (Cue's assessment bridge: assembleAssessmentContext).
+    // Additive and orthogonal to slot-fill: a therapy / session-report draft has
+    // no assessment block, so assessmentMode is false, nothing is appended, and
+    // the system prompt stays byte-identical to before. (canonical_data is
+    // already validated as a non-null, non-array object above.)
+    const _asmt = canonical_data.assessment;
+    const assessmentMode = !!_asmt && typeof _asmt === 'object' && !Array.isArray(_asmt);
 
     const userPayload = {
       date_range: date_range || null,
@@ -2494,14 +2507,14 @@ app.post('/format-draft', requireAuth, async (req, res) => {
         body: JSON.stringify({
           model:      'claude-opus-4-5',
           max_tokens: 16384,
-          system: slotFill
+          system: appendAssessmentAddendum(slotFill
             ? [
                 { type: 'text', text: FORMAT_DRAFT_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
                 { type: 'text', text: FORMAT_DRAFT_SLOT_ADDENDUM, cache_control: { type: 'ephemeral' } },
               ]
             : [
                 { type: 'text', text: FORMAT_DRAFT_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
-              ],
+              ], assessmentMode),
           messages: [{ role: 'user', content: userText }],
         }),
       });
@@ -2662,6 +2675,13 @@ app.post('/format-draft', requireAuth, async (req, res) => {
       input_tokens:  generationMetadata.tokens.input_tokens,
       output_tokens: generationMetadata.tokens.output_tokens,
       latency_ms:    latencyMs,
+      // Step 4 — prompt-discipline provenance, logged only for assessment drafts;
+      // for therapy drafts the spread is {} so this log object is unchanged.
+      ...(assessmentMode ? {
+        assessment_mode:             true,
+        assessment_addendum_version: FORMAT_DRAFT_ASSESSMENT_ADDENDUM_VERSION,
+        assessment_addendum_sha256:  FORMAT_DRAFT_ASSESSMENT_ADDENDUM_SHA256,
+      } : {}),
     }));
 
     return res.json({
