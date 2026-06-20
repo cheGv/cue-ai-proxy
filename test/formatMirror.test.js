@@ -122,3 +122,30 @@ test('smoke — minimal geometry renders to a non-empty .docx', async () => {
   assert.strictEqual(out.counts.tables, 1);
   assert.ok(hasIPA(out, 'ɛ'), 'IPA preserved in synthetic render');
 });
+
+// ── E-25: builder renders left tab stops + tab runs, and NEVER a table ─────────
+test('E-25 builder — a tabStops paragraph renders <w:tabs> + <w:tab/> and adds NO <w:tbl>', async () => {
+  const JSZip = require('jszip');
+  const geometry = {
+    page_setup: { width: 11906, height: 16838, orientation: 'portrait', margins: { top: 1440, bottom: 1440, left: 1140, right: 1140, header: 720, footer: 720 } },
+    default_font: { family: 'Arial', size: 21 },
+    numbering_definitions: { abstract: {}, nums: {} },
+    structure: [
+      {
+        type: 'paragraph',
+        runs: [{ text: 'Subtest' }, { tab: true }, { text: 'Raw Score' }, { tab: true }, { text: 'Percentile' }],
+        images: [],
+        tabStops: [{ type: 'left', position: 4400 }, { type: 'left', position: 6800 }],
+      },
+    ],
+    media: [],
+  };
+  const buf = await buildReportDocxV2({ geometry, renderMode: 'verbatim' });
+  const zip = await JSZip.loadAsync(buf);
+  const xml = await zip.file('word/document.xml').async('string');
+  assert.match(xml, /<w:tabs>/);
+  assert.match(xml, /<w:tab w:val="left" w:pos="4400"\/>/);
+  assert.match(xml, /<w:tab w:val="left" w:pos="6800"\/>/);
+  assert.strictEqual((xml.match(/<w:tab\//g) || []).length, 2, 'two tab elements between three cells');
+  assert.strictEqual((xml.match(/<w:tbl>/g) || []).length, 0, 'tab alignment must NEVER emit a table');
+});

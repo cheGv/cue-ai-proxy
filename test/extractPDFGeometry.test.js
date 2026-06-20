@@ -154,6 +154,126 @@ test('linesToParagraphs: wrapped continuation folds into one block', () => {
   assert.ok(blocks[0].runs.length >= 2);
 });
 
+// ── E-25: text-column alignment (tab stops, never a table) ────────────────────
+// Build real line objects (with .glyphs) the way the pipeline does — synthetic
+// shape-equivalents of the fixture rows, same style as the E-15 synthTable shapes.
+function gridLines(rows, opts = {}) {
+  const size = opts.size || 11;
+  const pitch = opts.pitch || 18;
+  const glyphs = [];
+  rows.forEach((cells, ri) => {
+    const baseTop = 100 + ri * pitch;
+    for (const c of cells) glyphs.push(glyph(c.t, c.x, c.t.length * 5.5, baseTop, size));
+  });
+  return groupGlyphsIntoLines(glyphs);
+}
+
+test('E-25 splitLineCells: a wide-gap score row → 3 cells; prose & narrow-marker list → 1 cell', () => {
+  const [scoreLine] = gridLines([[{ x: 72, t: 'Subtest' }, { x: 290, t: 'Raw' }, { x: 410, t: '9th' }]]);
+  assert.equal(splitLineCells(scoreLine).length, 3);
+  const [proseLine] = gridLines([[{ x: 72, t: 'This is ordinary prose with normal word spacing' }]]);
+  assert.equal(splitLineCells(proseLine).length, 1);
+  // a list marker sits ~1 char from its text (narrow) → stays one cell
+  const [listLine] = groupGlyphsIntoLines([glyph('1.', 72, 8, 100, 11), glyph('Expand vocabulary', 84, 90, 100, 11)]);
+  assert.equal(splitLineCells(listLine).length, 1);
+});
+
+test('E-25 detectColumnarBlocks: a borderless score grid (4 rows × 3 aligned cols) → one block', () => {
+  const lines = gridLines([
+    [{ x: 72, t: 'Subtest' }, { x: 290, t: 'Raw Score' }, { x: 410, t: 'Percentile' }],
+    [{ x: 72, t: 'Auditory comprehension' }, { x: 290, t: '18' }, { x: 410, t: '9th' }],
+    [{ x: 72, t: 'Expressive communication' }, { x: 290, t: '14' }, { x: 410, t: '5th' }],
+    [{ x: 72, t: 'Total language' }, { x: 290, t: '16' }, { x: 410, t: '6th' }],
+  ]);
+  const blocks = detectColumnarBlocks(lines);
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].colXs.length, 3);
+  assert.equal(blocks[0].rows.length, 4);
+});
+
+test('E-25 evaluateColumnRun: 3 aligned rows pass, returns the column means', () => {
+  const lines = gridLines([
+    [{ x: 72, t: 'Aa' }, { x: 290, t: 'Bb' }],
+    [{ x: 72, t: 'Cc' }, { x: 290, t: 'Dd' }],
+    [{ x: 72, t: 'Ee' }, { x: 290, t: 'Ff' }],
+  ]);
+  const ev = evaluateColumnRun(lines.map((ln) => ({ line: ln, cells: splitLineCells(ln) })));
+  assert.ok(ev);
+  assert.equal(ev.colXs.length, 2);
+  assert.ok(Math.abs(ev.colXs[0] - 72) < 1 && Math.abs(ev.colXs[1] - 290) < 1);
+});
+
+test('E-25 anti-phantom: a label:value demographics block is NOT columnized', () => {
+  const lines = gridLines([
+    [{ x: 72, t: 'Name of child: Asha' }, { x: 320, t: 'Date of Assessment: 02.06' }],
+    [{ x: 72, t: 'Date of Birth: 14.09.2021' }, { x: 320, t: 'Age/Gender: 4Y/M' }],
+    [{ x: 72, t: 'Clinician: Riya Sharma' }, { x: 320, t: 'Languages: English' }],
+  ]);
+  assert.equal(detectColumnarBlocks(lines).length, 0); // label:value form, not a data grid
+});
+
+test('E-25 anti-phantom: a numbered list (forced into two cells) is rejected by the marker rule', () => {
+  // even when a wide gap splits marker from text, a list must not become columns
+  const lines = gridLines([
+    [{ x: 72, t: '1.' }, { x: 290, t: 'Continue weekly therapy' }],
+    [{ x: 72, t: '2.' }, { x: 290, t: 'Introduce AAC core board' }],
+    [{ x: 72, t: '3.' }, { x: 290, t: 'Parent coaching at home' }],
+  ]);
+  assert.equal(detectColumnarBlocks(lines).length, 0);
+});
+
+test('E-25 anti-phantom: fewer than 3 consecutive rows is never a column block', () => {
+  const lines = gridLines([
+    [{ x: 72, t: 'Subtest' }, { x: 290, t: 'Score' }],
+    [{ x: 72, t: 'Naming' }, { x: 290, t: '12' }],
+  ]);
+  assert.equal(detectColumnarBlocks(lines).length, 0);
+});
+
+test('E-25 anti-phantom: misaligned columns (high cross-row variance) are rejected', () => {
+  // col-2 wanders (290 / 312 / 334): no shared boundary in ≥75% of rows → not a grid
+  const lines = gridLines([
+    [{ x: 72, t: 'Alpha' }, { x: 290, t: 'one' }],
+    [{ x: 72, t: 'Bravo' }, { x: 312, t: 'two' }],
+    [{ x: 72, t: 'Charlie' }, { x: 334, t: 'three' }],
+  ]);
+  assert.equal(detectColumnarBlocks(lines).length, 0);
+});
+
+test('E-25 linesToParagraphs: a score grid becomes tab-aligned paragraphs (tab runs + left tab stops, NO table)', () => {
+  const lines = gridLines([
+    [{ x: 72, t: 'Subtest' }, { x: 290, t: 'Raw Score' }, { x: 410, t: 'Percentile' }],
+    [{ x: 72, t: 'Auditory comprehension' }, { x: 290, t: '18' }, { x: 410, t: '9th' }],
+    [{ x: 72, t: 'Expressive communication' }, { x: 290, t: '14' }, { x: 410, t: '5th' }],
+  ]);
+  const blocks = linesToParagraphs(lines, 595, 72, 72); // marginLeft = 72 (= col 1)
+  assert.equal(blocks.length, 3);
+  assert.equal(blocks.every((b) => b.type === 'paragraph'), true); // never a table
+  for (const b of blocks) {
+    assert.ok(Array.isArray(b.tabStops) && b.tabStops.length === 2, 'two tab stops for three columns');
+    assert.deepEqual(b.tabStops.map((t) => t.position), [ptToDxa(290 - 72), ptToDxa(410 - 72)]);
+    assert.equal(b.tabStops.every((t) => t.type === 'left'), true);
+    assert.equal(b.runs.filter((r) => r.tab).length, 2, 'two tab runs between three cells');
+  }
+  const headerText = blocks[0].runs.map((r) => (r.tab ? '\t' : r.text)).join('');
+  assert.equal(headerText, 'Subtest\tRaw Score\tPercentile');
+});
+
+test('E-25 buildColumnarParagraphs: indented first column → indent.left; tab stops measured from margin', () => {
+  const lines = gridLines([
+    [{ x: 120, t: 'Alpha' }, { x: 300, t: 'one' }],
+    [{ x: 120, t: 'Bravo' }, { x: 300, t: 'two' }],
+    [{ x: 120, t: 'Charlie' }, { x: 300, t: 'three' }],
+  ]);
+  const [block] = detectColumnarBlocks(lines);
+  assert.ok(block);
+  const paras = buildColumnarParagraphs(block, 72); // margin 72; col 1 at 120 → 48pt indent
+  assert.equal(paras.length, 3);
+  assert.deepEqual(paras[0].indent, { left: ptToDxa(120 - 72) });
+  assert.deepEqual(paras[0].tabStops.map((t) => t.position), [ptToDxa(300 - 72)]);
+  assert.equal(paras[0].runs.filter((r) => r.tab).length, 1);
+});
+
 // ── segments ──────────────────────────────────────────────────────────────────
 test('pushSeg classifies axis-aligned segments, drops diagonals', () => {
   const segs = [];
