@@ -8,9 +8,23 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { buildReportDocxV2 } = require('../lib/buildReportDocxV2');
+const { buildReportDocxV2, _internals: { fitMediaToWidth } } = require('../lib/buildReportDocxV2');
 const { extractGeometry } = require('../lib/extractGeometry');
 const { identifySlots } = require('../lib/identifySlots');
+
+// Mirror P1 — band image width-fit (scale down to printable width, keep aspect).
+test('P1 fitMediaToWidth: over-wide band scales to fit, aspect preserved, no upscale', () => {
+  const PT = 12700; // EMU per pt
+  const band = { anchor: { x: 0, y: 0, width: 600 * PT, height: 150 * PT }, bytes: Buffer.from([1]) };
+  const fit = fitMediaToWidth(band, 480 * PT); // 600pt → 480pt (scale 0.8)
+  assert.equal(fit.anchor.width, Math.round(600 * PT * (480 / 600)), 'width scaled to max');
+  assert.ok(Math.abs(fit.anchor.width / fit.anchor.height - 4) < 0.01, 'aspect ratio (4:1) preserved');
+  assert.equal(fit.wrap_mode, 'inline', 'band renders inline, never floating');
+  // an already-fitting band is returned unchanged in size (never upscaled)
+  const small = fitMediaToWidth({ anchor: { width: 300 * PT, height: 100 * PT } }, 480 * PT);
+  assert.equal(small.anchor.width, 300 * PT);
+  assert.equal(small.anchor.height, 100 * PT);
+});
 
 function allText(g) {
   const out = [];

@@ -7,17 +7,25 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
+const fs = require('fs');
+const path = require('path');
 const { _internals, extractPDFGeometry } = require('../lib/extractPDFGeometry');
 
 const {
   matMul, applyMatrix, ptToDxa, ptToEmu,
   cleanFontFamily, fontIsBold, fontIsItalic, clusterPositions,
   buildLineRuns, groupGlyphsIntoLines, detectAlignment, indentLeftDxa,
-  linesToParagraphs, pushSeg, collectPathSegments, detectTablesFromSegments,
+  linesToParagraphs,
+  splitLineCells, evaluateColumnRun, detectColumnarBlocks, buildColumnarParagraphs,
+  pushSeg, collectPathSegments, detectTablesFromSegments,
   mergeSliverColumns, refineTableDescs,
   indexForBoundary, buildTableBlock, imageAnchorFromCtm, encodePng,
   inferContentArea, buildPageSetup, buildDefaultFont, finalizeBlocks,
   isCellEmpty, computeTableOccupancy, MIN_TABLE_OCCUPANCY,
+  colorsEqual, pathIsFillOnly, pathHasStroke, paintType, rectFromMinMax,
+  backdropColor, eligible, E24_MAX_RULE_FRAC,
+  segInTableRegion, tableHasVisibleRule,
+  imageBoxesMatch, classifyImagePlacement,
 } = _internals;
 
 // A synthetic glyph in the extractor's internal shape (top-down points).
@@ -472,3 +480,358 @@ test('extractPDFGeometry is exported as an async function', () => {
   assert.equal(typeof extractPDFGeometry, 'function');
   assert.equal(extractPDFGeometry.constructor.name, 'AsyncFunction');
 });
+
+// ── E-24: invisible-fill guard (ported from guard.py) ─────────────────────────
+// E-15 catches phantom grids whose CELLS are empty. E-24 catches the other kind:
+// the DOCX→PDF exporter stamps a white rectangle behind every text line, so the
+// phantom cells are NOT empty (text sits in them) and survive E-15. The guard
+// kills them at the path, before any segment reaches detectTablesFromSegments.
+// Same methodology as the E-15 tests: synthetic, shape-equivalent inputs through
+// the pure helpers (no pdfjs, no real PDF needed).
+
+// A fake OPS enum (only the paint ops paintType reads) for the type-mapping test.
+const E24_OPS = {
+  fill: 22, eoFill: 23, stroke: 20, closeStroke: 21,
+  fillStroke: 24, eoFillStroke: 25, closeFillStroke: 26, closeEOFillStroke: 27,
+  endPath: 28,
+};
+
+// Build a rectangular path in the exact shape extractPageGraphics produces:
+// {type, rect (top-down pts), fill (0–1 RGB or null), segs (axis-aligned edges)}.
+// Segments are emitted via the real pushSeg so the table-detection contrast is
+// driven only by the guard, not by a hand-rolled segment shape.
+function rectPath(type, x0, y0, x1, y1, fill) {
+  const segs = [];
+  pushSeg(segs, x0, y0, x1, y0); // top
+  pushSeg(segs, x0, y1, x1, y1); // bottom
+  pushSeg(segs, x0, y0, x0, y1); // left
+  pushSeg(segs, x1, y0, x1, y1); // right
+  return { type, rect: { x0, y0, x1, y1, width: x1 - x0, height: y1 - y0 }, fill: fill || null, segs };
+}
+
+// The post-walk half of extractPageGraphics: filter paths through eligible(),
+// then flatten the survivors' segments — exactly what now feeds table detection.
+function eligibleSegs(paths, pageBg = [1, 1, 1], pageArea = 595 * 842) {
+  const segs = [];
+  for (const p of paths) {
+    if (eligible(p, paths, pageBg, E24_MAX_RULE_FRAC, pageArea)) {
+      for (const s of p.segs) segs.push(s);
+    }
+  }
+  return segs;
+}
+
+test('E-24 colorsEqual: tolerant white match, rejects off-white and null', () => {
+  assert.equal(colorsEqual([1, 1, 1], [1, 1, 1]), true);
+  assert.equal(colorsEqual([1, 1, 1], [0.99, 1, 1]), true); // within 0.02 tol
+  assert.equal(colorsEqual([1, 1, 1], [0.9, 0.9, 0.9]), false); // light grey ≠ white
+  assert.equal(colorsEqual(null, [1, 1, 1]), false); // unknown fill never matches
+  assert.equal(colorsEqual([1, 1, 1], null), false);
+});
+
+test('E-24 type predicates: fill-only vs has-stroke', () => {
+  assert.equal(pathIsFillOnly({ type: 'f' }), true);
+  assert.equal(pathIsFillOnly({ type: 'fs' }), false);
+  assert.equal(pathIsFillOnly({ type: 's' }), false);
+  assert.equal(pathHasStroke({ type: 's' }), true);
+  assert.equal(pathHasStroke({ type: 'fs' }), true);
+  assert.equal(pathHasStroke({ type: 'f' }), false);
+});
+
+test('E-24 paintType maps pdfjs paint ops to f / s / fs / n', () => {
+  assert.equal(paintType(E24_OPS.fill, E24_OPS), 'f');
+  assert.equal(paintType(E24_OPS.eoFill, E24_OPS), 'f');
+  assert.equal(paintType(E24_OPS.stroke, E24_OPS), 's');
+  assert.equal(paintType(E24_OPS.closeStroke, E24_OPS), 's');
+  assert.equal(paintType(E24_OPS.fillStroke, E24_OPS), 'fs');
+  assert.equal(paintType(E24_OPS.closeEOFillStroke, E24_OPS), 'fs');
+  assert.equal(paintType(E24_OPS.endPath, E24_OPS), 'n'); // clip / no-op → passes through
+});
+
+test('E-24 rectFromMinMax: minMax → top-down rect under CTM; non-finite → null', () => {
+  // identity CTM, page H=792: PDF box [100,600]..[300,620] flips to top-down y.
+  const r = rectFromMinMax([100, 600, 300, 620], [1, 0, 0, 1, 0, 0], 792);
+  assert.equal(r.x0, 100);
+  assert.equal(r.x1, 300);
+  assert.equal(r.y0, 792 - 620);
+  assert.equal(r.y1, 792 - 600);
+  assert.equal(r.width, 200);
+  assert.equal(r.height, 20);
+  // a path that opened with a curve carries a non-finite minMax → null rect
+  assert.equal(rectFromMinMax([Infinity, Infinity, -Infinity, -Infinity], [1, 0, 0, 1, 0, 0], 792), null);
+});
+
+test('E-24 backdropColor: smallest enclosing fill, else page background', () => {
+  const big = rectPath('f', 0, 0, 500, 700, [0, 0, 1]);       // blue, encloses all
+  const mid = rectPath('f', 50, 50, 300, 300, [0, 1, 0]);     // green, encloses small
+  const small = rectPath('f', 100, 100, 200, 150, [1, 1, 1]); // white, inside both
+  const fills = [big, mid, small];
+  // small's backdrop is the SMALLEST enclosing OTHER fill → green, not blue
+  assert.deepEqual(backdropColor(small, fills, [1, 1, 1]), [0, 1, 0]);
+  // big encloses nothing else → backdrop is the page background
+  assert.deepEqual(backdropColor(big, fills, [1, 1, 1]), [1, 1, 1]);
+});
+
+test('E-24 eligible: drops invisible white-on-white fill, keeps visible + stroked', () => {
+  const whiteOnPage = rectPath('f', 100, 100, 200, 130, [1, 1, 1]);
+  const colouredFill = rectPath('f', 100, 200, 200, 230, [0.2, 0.4, 0.8]);
+  const strokeRule = rectPath('s', 100, 300, 200, 330, null);
+  const all = [whiteOnPage, colouredFill, strokeRule];
+  assert.equal(eligible(whiteOnPage, all), false); // invisible → dropped (E-24)
+  assert.equal(eligible(colouredFill, all), true);  // visible colour → kept
+  assert.equal(eligible(strokeRule, all), true);    // stroke → always kept
+});
+
+test('E-24 eligible: a fill bigger than half the page is a decorative band → dropped', () => {
+  const pageArea = 595 * 842;
+  const band = rectPath('f', 0, 0, 595, 600, [0.95, 0.95, 0.95]); // > 50% page, visible grey
+  assert.equal(eligible(band, [band], [1, 1, 1], 0.5, pageArea), false);
+  const rule = rectPath('f', 0, 0, 200, 20, [0.95, 0.95, 0.95]); // same grey, modest size
+  assert.equal(eligible(rule, [rule], [1, 1, 1], 0.5, pageArea), true);
+});
+
+test('E-24 eligible: white fill on a COLOURED backdrop is visible → kept', () => {
+  const card = rectPath('f', 50, 50, 400, 400, [0.1, 0.2, 0.5]);    // navy card
+  const whiteBox = rectPath('f', 100, 100, 300, 130, [1, 1, 1]);    // white box on navy
+  assert.equal(eligible(whiteBox, [card, whiteBox]), true); // backdrop navy ≠ white → visible
+  // and a fill matching its coloured backdrop IS invisible → dropped
+  const sameOnCard = rectPath('f', 100, 100, 300, 130, [0.1, 0.2, 0.5]);
+  assert.equal(eligible(sameOnCard, [card, sameOnCard]), false);
+});
+
+// The 3-col × 4-row layout of white per-line fills that defeated E-15 on Ikansh.
+function phantomWhiteGrid() {
+  const cols = [72, 172, 272, 372]; // 3 columns, 100pt each (≥ MIN_COL_PT)
+  const rows = [100, 130, 160, 190, 220]; // 4 rows, 30pt each
+  const paths = [];
+  for (let r = 0; r < rows.length - 1; r++) {
+    for (let c = 0; c < cols.length - 1; c++) {
+      paths.push(rectPath('f', cols[c], rows[r], cols[c + 1], rows[r + 1], [1, 1, 1]));
+    }
+  }
+  return paths;
+}
+
+test('E-24 Inside Out (Ikansh): white per-line fills ARE misread as a table WITHOUT the guard', () => {
+  // Control — the pre-E-24 behaviour: every path's segments reach detection.
+  const rawSegs = phantomWhiteGrid().flatMap((p) => p.segs);
+  const tables = detectTablesFromSegments(rawSegs);
+  assert.equal(tables.length, 1, 'unguarded white-fill grid is misread as a table');
+  assert.ok(tables[0].rowYs.length >= 3 && tables[0].colXs.length >= 3);
+});
+
+test('E-24 Inside Out (Ikansh): the guard drops every invisible fill → phantom table is gone', () => {
+  const segs = eligibleSegs(phantomWhiteGrid()); // filter → flatten (what extractPageGraphics now feeds)
+  assert.equal(segs.length, 0, 'all white-on-white fills dropped → zero segments survive');
+  assert.deepEqual(detectTablesFromSegments(segs), [], 'no phantom table inferred');
+});
+
+test('E-24 Vrushali (clean text report): no fill-only invisible paths → guard is a no-op', () => {
+  assert.deepEqual(eligibleSegs([]), []); // no vector content at all → no-op
+  // a report whose only vector marks are visible stroked rules (header/footer
+  // underlines): the guard must touch nothing — same segment count in and out.
+  const strokes = [rectPath('s', 72, 80, 520, 82, null), rectPath('s', 72, 740, 520, 742, null)];
+  const rawCount = strokes.flatMap((p) => p.segs).length;
+  assert.equal(eligibleSegs(strokes).length, rawCount, 'no stroke dropped (no-op)');
+  assert.deepEqual(detectTablesFromSegments(eligibleSegs(strokes)), [], 'two underlines are not a table');
+});
+
+test('E-24 real bordered table: stroked rules are all eligible → table still inferred', () => {
+  // Same geometry as the phantom grid, but drawn as STROKES rather than fills.
+  const cols = [72, 172, 272, 372];
+  const rows = [100, 130, 160, 190, 220];
+  const paths = [];
+  for (let r = 0; r < rows.length - 1; r++) {
+    for (let c = 0; c < cols.length - 1; c++) {
+      paths.push(rectPath('s', cols[c], rows[r], cols[c + 1], rows[r + 1], null));
+    }
+  }
+  const segs = eligibleSegs(paths);
+  assert.equal(segs.length, paths.flatMap((p) => p.segs).length, 'no stroked rule dropped');
+  const tables = detectTablesFromSegments(segs);
+  assert.equal(tables.length, 1);
+  assert.equal(tables[0].colXs.length, 4); // 3 columns survive
+  assert.equal(tables[0].rowYs.length, 5); // 4 rows survive
+});
+
+test('E-24 real table with white cell fills: fills drop, stroked rules keep the table', () => {
+  // The hardest case: a genuine bordered table whose cells ALSO carry white
+  // background fills. The fills are invisible (dropped); the stroked rules that
+  // actually define the table survive, so the table is still inferred.
+  const cols = [72, 172, 272, 372];
+  const rows = [100, 130, 160, 190, 220];
+  const paths = [];
+  for (let r = 0; r < rows.length - 1; r++) {
+    for (let c = 0; c < cols.length - 1; c++) {
+      paths.push(rectPath('f', cols[c], rows[r], cols[c + 1], rows[r + 1], [1, 1, 1])); // white cell bg
+      paths.push(rectPath('s', cols[c], rows[r], cols[c + 1], rows[r + 1], null));       // stroked border
+    }
+  }
+  const segs = eligibleSegs(paths);
+  const strokeSegCount = paths.filter((p) => p.type === 's').flatMap((p) => p.segs).length;
+  assert.equal(segs.length, strokeSegCount, 'only stroked rules survive; white cell fills dropped');
+  const tables = detectTablesFromSegments(segs);
+  assert.equal(tables.length, 1, 'the real table is still inferred from its rules');
+  assert.equal(tables[0].colXs.length, 4);
+});
+
+// ── E-24b: visible-rule gate ──────────────────────────────────────────────────
+// E-24 drops invisible FILLS; E-24b rejects a detected table region backed by NO
+// visible rule — the per-line CLIP rectangles that paint nothing yet still rule a
+// grid (Ikansh p.3, which defeats E-24 (no fill) and E-15 (cells non-empty)). The
+// signal is visible-rule BACKING, not clip-ness: clips also live inside real
+// tables, so a visible stroke/fill anywhere in the region vouches for it.
+
+// tag a segment list with a visibility flag (mirrors extractPageGraphics).
+function tagVis(segs, vis) { for (const s of segs) s.vis = vis; return segs; }
+// the 4 edges of a rectangle as segments (top-down pts), via the real pushSeg.
+function rectSegs(x0, y0, x1, y1) {
+  const s = [];
+  pushSeg(s, x0, y0, x1, y0);
+  pushSeg(s, x0, y1, x1, y1);
+  pushSeg(s, x0, y0, x0, y1);
+  pushSeg(s, x1, y0, x1, y1);
+  return s;
+}
+
+test('E-24b segInTableRegion: horizontal + vertical membership with tolerance', () => {
+  const d = { top: 100, bottom: 220, left: 72, right: 372 };
+  assert.equal(segInTableRegion({ horizontal: true, y: 130, x1: 72, x2: 372 }, d), true);
+  assert.equal(segInTableRegion({ horizontal: true, y: 400, x1: 72, x2: 372 }, d), false); // below
+  assert.equal(segInTableRegion({ horizontal: true, y: 130, x1: 500, x2: 560 }, d), false); // no x-overlap
+  assert.equal(segInTableRegion({ vertical: true, x: 172, y1: 100, y2: 220 }, d), true);
+  assert.equal(segInTableRegion({ vertical: true, x: 500, y1: 100, y2: 220 }, d), false); // right of region
+});
+
+test('E-24b tableHasVisibleRule: ≥1 visible seg in region passes; all-invisible fails', () => {
+  const d = { top: 100, bottom: 220, left: 72, right: 372 };
+  const clip = tagVis([{ horizontal: true, y: 130, x1: 72, x2: 372 }], false); // invisible clip rule
+  const stroke = tagVis([{ horizontal: true, y: 130, x1: 72, x2: 372 }], true); // visible rule
+  assert.equal(tableHasVisibleRule(d, clip), false); // pure clip → no visible backing
+  assert.equal(tableHasVisibleRule(d, [...clip, ...stroke]), true); // one visible rule vouches
+  const farStroke = tagVis([{ horizontal: true, y: 600, x1: 72, x2: 372 }], true);
+  assert.equal(tableHasVisibleRule(d, [...clip, ...farStroke]), false); // visible but outside region
+});
+
+test('E-24b Ikansh p.3 shape: clip-only grid IS detected but has NO visible rule → rejected', () => {
+  // 3×4 grid of CLIP rectangles (vis=false) — defeats E-24 (no fill) and E-15
+  // (cells non-empty), exactly the page-3 phantom.
+  const cols = [72, 172, 272, 372];
+  const rows = [100, 130, 160, 190, 220];
+  const segs = [];
+  for (let r = 0; r < rows.length - 1; r++) {
+    for (let c = 0; c < cols.length - 1; c++) segs.push(...tagVis(rectSegs(cols[c], rows[r], cols[c + 1], rows[r + 1]), false));
+  }
+  const descs = refineTableDescs(detectTablesFromSegments(segs), 1); // page idx 1 (not the header band)
+  assert.equal(descs.length, 1, 'clip grid IS detected as a table by geometry alone');
+  assert.equal(descs.every((d) => !tableHasVisibleRule(d, segs)), true, 'phantom rejected: zero visible rules');
+});
+
+test('E-24b real table: a clip grid WITH ≥1 visible rule in-region survives the gate', () => {
+  // vrishin-shape: clips supply grid geometry, but a real drawn rule also exists
+  // in the region → the gate keeps it (clip-ness alone is NOT the signal).
+  const cols = [72, 172, 272, 372];
+  const rows = [100, 130, 160, 190, 220];
+  const segs = [];
+  for (let r = 0; r < rows.length - 1; r++) {
+    for (let c = 0; c < cols.length - 1; c++) segs.push(...tagVis(rectSegs(cols[c], rows[r], cols[c + 1], rows[r + 1]), false));
+  }
+  segs.push(...tagVis([{ horizontal: true, y: 100, x1: 72, x2: 372, len: 300 }], true)); // one genuine drawn rule
+  const descs = refineTableDescs(detectTablesFromSegments(segs), 1);
+  assert.equal(descs.length, 1);
+  assert.equal(descs.some((d) => tableHasVisibleRule(d, segs)), true, 'visible rule vouches → table kept');
+});
+
+// ── Mirror P1: image-placement classification ────────────────────────────────
+// Classify source images by GEOMETRY + cross-page RECURRENCE into header /
+// footer / inline. Validated against the real Ikansh bboxes (the user's
+// reference) — shape-equivalent, no PDF needed. Guardrail: no recurring band →
+// bandFound=false → caller leaves images floating (clean reports unchanged).
+
+test('P1 imageBoxesMatch: tolerant bbox equality for recurrence', () => {
+  const a = { x: 0, y: 0, w: 613, h: 152 };
+  assert.equal(imageBoxesMatch(a, { x: 2, y: 1, w: 611, h: 153 }), true); // within 6pt
+  assert.equal(imageBoxesMatch(a, { x: 20, y: 0, w: 613, h: 152 }), false); // x off by 20
+});
+
+test('P1 classifyImagePlacement: Ikansh shape → header / footer / inline', () => {
+  const PW = 595, PH = 842;
+  const logo = (page) => ({ x: 0, y: 0, w: 613, h: 152, page, pageW: PW, pageH: PH });   // (0,0,613,152) all pages
+  const foot = (page) => ({ x: 0, y: 805, w: 608, h: 37, page, pageW: PW, pageH: PH });   // (0,805,608,842) all pages
+  const sig = { x: 49, y: 579, w: 121, h: 74, page: 3, pageW: PW, pageH: PH };             // page 3 only
+  const boxes = [logo(1), foot(1), logo(2), foot(2), logo(3), foot(3), sig];
+  const { roles, bandFound } = classifyImagePlacement(boxes, 3);
+  assert.equal(bandFound, true);
+  assert.deepEqual(roles, ['header', 'footer', 'header', 'footer', 'header', 'footer', 'inline']);
+});
+
+test('P1 classifyImagePlacement: NO recurring band → all inline, bandFound=false (guardrail)', () => {
+  const PW = 595, PH = 842;
+  const boxes = [
+    { x: 100, y: 300, w: 200, h: 120, page: 1, pageW: PW, pageH: PH }, // mid-page figure, one page
+    { x: 0, y: 0, w: 600, h: 140, page: 1, pageW: PW, pageH: PH },     // top band but ONE page → not recurring
+  ];
+  const { roles, bandFound } = classifyImagePlacement(boxes, 3);
+  assert.equal(bandFound, false);
+  assert.deepEqual(roles, ['inline', 'inline']);
+});
+
+test('P1 classifyImagePlacement: recurring but NOT full-width (small logo) → not a band', () => {
+  const PW = 595, PH = 842;
+  const small = (page) => ({ x: 40, y: 30, w: 150, h: 60, page, pageW: PW, pageH: PH }); // ~25% width
+  const { roles, bandFound } = classifyImagePlacement([small(1), small(2), small(3)], 3);
+  assert.equal(bandFound, false);
+  assert.deepEqual(roles, ['inline', 'inline', 'inline']);
+});
+
+// ── E-24 end-to-end against REAL PDFs (fixture-gated, PII-safe) ────────────────
+// The shape-equivalent tests above prove the guard's logic; these prove it on the
+// actual exporter output the task names. Like formatMirror's fixtures, the real
+// clinical PDFs are PII (children's reports) and are deliberately NOT committed —
+// provide them via MIRROR_FIXTURES_DIR (or drop them in test/fixtures/) and these
+// run; otherwise they SKIP cleanly so the committed suite stays green and PII-free.
+//   MIRROR_FIXTURES_DIR=C:/Users/<you>/Downloads node --test test/extractPDFGeometry.test.js
+const PDF_DIRS = [process.env.MIRROR_FIXTURES_DIR, path.join(__dirname, 'fixtures')].filter(Boolean);
+function findPdf(names) {
+  for (const dir of PDF_DIRS) for (const n of names) {
+    const p = path.join(dir, n);
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+// Candidate filenames per fixture — exact names first, fallback spellings after.
+const IKANSH_PDF = findPdf(['Ikansh Shetty  SALT Progress Report.pdf', 'ikansh.pdf', 'Ikansh.pdf', 'Inside Out Ikansh.pdf']);
+const AADYA_PDF = findPdf(['Speech and language Assessment  report - Aadya.pdf', 'aadya.pdf', 'Aadya.pdf', 'vrushali.pdf', 'Vrushali.pdf']);
+const VRISHIN_PT_PDF = findPdf(['vrishin PT.pdf', 'vrishin_pt.pdf', 'Vrishin PT.pdf']);
+
+// THE headline: Inside Out (Ikansh) is a narrative report whose only "table" was
+// the phantom grid from invisible white per-line fills. With E-24 it must extract
+// with ZERO tables. (If this copy genuinely contains a real table, narrow this to
+// assert the wide phantom grid specifically is absent.)
+test('E-24 e2e — Inside Out (Ikansh): real PDF extracts with NO phantom table',
+  { skip: IKANSH_PDF ? false : 'Ikansh PDF absent (set MIRROR_FIXTURES_DIR)' }, async () => {
+    const g = await extractPDFGeometry(fs.readFileSync(IKANSH_PDF));
+    assert.strictEqual(g.counts.tables, 0, `expected 0 tables after E-24, got ${g.counts.tables}`);
+    assert.ok((g.structure || []).some((b) => b.type === 'paragraph'), 'content still extracts as paragraphs');
+  });
+
+// Regression — a clean text report (Aadya) is a no-op: still zero tables, still
+// extracts its content. (The rigorous guard-on vs guard-off geometry equality is
+// proven separately by scripts/_e24_diag.js against the committed pre-E-24 build.)
+test('E-24 e2e — Aadya (clean text report): real PDF stays table-free',
+  { skip: AADYA_PDF ? false : 'Aadya PDF absent (set MIRROR_FIXTURES_DIR)' }, async () => {
+    const g = await extractPDFGeometry(fs.readFileSync(AADYA_PDF));
+    assert.strictEqual(g.counts.tables, 0, `clean report should have 0 tables, got ${g.counts.tables}`);
+    assert.ok((g.structure || []).length > 0, 'content still extracts');
+  });
+
+// Extra case — vrishin PT is NOT a confirmed bordered-table report; neither of us
+// has verified it contains a real table. So this test only asserts the extractor
+// runs cleanly and reports the structure; ZERO tables is an acceptable outcome
+// (it may simply have no table). scripts/_e24_diag.js prints the detected counts.
+test('E-24 e2e — vrishin PT (extra case): extractor runs and produces structure',
+  { skip: VRISHIN_PT_PDF ? false : 'vrishin PT PDF absent (set MIRROR_FIXTURES_DIR)' }, async () => {
+    const g = await extractPDFGeometry(fs.readFileSync(VRISHIN_PT_PDF));
+    assert.ok(Array.isArray(g.structure), 'extraction produced a structure array');
+    assert.ok(g.counts && typeof g.counts.tables === 'number', 'counts.tables is reported');
+  });
