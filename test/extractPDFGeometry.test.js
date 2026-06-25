@@ -19,12 +19,15 @@ const {
   splitLineCells, evaluateColumnRun, detectColumnarBlocks, buildColumnarParagraphs,
   pushSeg, collectPathSegments, detectTablesFromSegments,
   mergeSliverColumns, refineTableDescs,
+  rowHasInteriorRule, trimTableToGridCore,
   indexForBoundary, buildTableBlock, imageAnchorFromCtm, encodePng,
   inferContentArea, buildPageSetup, buildDefaultFont, finalizeBlocks,
   isCellEmpty, computeTableOccupancy, MIN_TABLE_OCCUPANCY,
   colorsEqual, pathIsFillOnly, pathHasStroke, paintType, rectFromMinMax,
   backdropColor, eligible, E24_MAX_RULE_FRAC,
   segInTableRegion, tableHasVisibleRule,
+  rgbToHex, hexToRgb, colorLuminance, isNearBlack, safeRunColor,
+  assignGlyphColors, cellShadingFor, applyColorContrastSafety,
   imageBoxesMatch, classifyImagePlacement,
 } = _internals;
 
@@ -452,6 +455,68 @@ test('refineTableDescs: drops single-column boxes and the page-1 header band', (
   // page 1: header-band rule does NOT apply (only page 0)
   const keptP1 = refineTableDescs([headerBand], 1);
   assert.equal(keptP1.length, 1);
+});
+
+// ── decorative-fill over-merge guard: trim a table to its grid core ──────────
+// A visible decorative fill near a table (section band / label strip / chips)
+// emits rule segments that merge into the table's row band. Real grid rows are
+// crossed by an INTERIOR vertical rule; decorative bands are not. trim keeps the
+// maximal contiguous run of grid rows; the rest peel back to paragraphs. Pure
+// geometry — never reads fill colour (orthogonal to E-24/E-24b). Synthetic,
+// shape-equivalent inputs (no pdfjs / real PDF), same style as the E-15/E-24 tests.
+
+// vertical rule segment in extractPageGraphics' shape (top-down pts).
+const vseg = (x, y1, y2) => ({ vertical: true, x, y1, y2, len: y2 - y1 });
+
+test('rowHasInteriorRule: interior rule crosses → true; edge-only / non-crossing → false', () => {
+  // x=50 is interior to [0,100] and spans the row's mid-y (110) → true
+  assert.equal(rowHasInteriorRule(100, 120, [vseg(50, 100, 120)], 0, 100), true);
+  // x=0 and x=100 are the outer edges (within INTERIOR_X_TOL) → not interior
+  assert.equal(rowHasInteriorRule(100, 120, [vseg(0, 100, 120), vseg(100, 100, 120)], 0, 100), false);
+  // interior x but the rule does not span this row's mid-y → false
+  assert.equal(rowHasInteriorRule(100, 120, [vseg(50, 200, 300)], 0, 100), false);
+});
+
+test('trimTableToGridCore (FAB §2 shape): peels leading band + spacer + trailing label + detached chips', () => {
+  // 10 rows: r0 SECTION band, r1 spacer, r2..r7 real grid, r8 label band, r9 chips.
+  const rowYs = [184, 202, 220, 242, 260, 280, 300, 320, 340, 366, 384];
+  const desc = { rowYs, colXs: [57, 207, 357, 537], left: 57, right: 537, top: 184, bottom: 384 };
+  const segs = [
+    vseg(57, 184, 384), vseg(537, 184, 384),   // outer edges (not interior)
+    vseg(207, 220, 340), vseg(357, 220, 340),   // interior column rules over rows 2..7 only
+    vseg(207, 366, 384), vseg(357, 366, 384),   // chips' own internal rules (row 9, detached)
+  ];
+  const out = trimTableToGridCore(desc, segs);
+  assert.ok(out && out !== desc, 'a trim happened');
+  // kept = rows 2..7 → boundaries rowYs[2..8]
+  assert.deepEqual(out.rowYs, [220, 242, 260, 280, 300, 320, 340]);
+  assert.equal(out.rowYs.length - 1, 6, 'six real data rows kept');
+  assert.equal(out.top, 220);
+  assert.equal(out.bottom, 340);
+});
+
+test('trimTableToGridCore: an all-grid table is returned unchanged (no spurious trim)', () => {
+  const rowYs = [100, 120, 140, 160];
+  const desc = { rowYs, colXs: [0, 100, 200], left: 0, right: 200, top: 100, bottom: 160 };
+  const segs = [vseg(0, 100, 160), vseg(100, 100, 160), vseg(200, 100, 160)]; // x=100 interior, spans all rows
+  assert.strictEqual(trimTableToGridCore(desc, segs), desc);
+});
+
+test('trimTableToGridCore: a stack of full-width bands (no interior rule) → null (not a table)', () => {
+  const rowYs = [100, 120, 140];
+  const desc = { rowYs, colXs: [0, 200], left: 0, right: 200, top: 100, bottom: 140 };
+  const segs = [vseg(0, 100, 140), vseg(200, 100, 140)]; // edges only
+  assert.equal(trimTableToGridCore(desc, segs), null);
+});
+
+test('trimTableToGridCore: a non-grid row splitting two runs → keeps the LARGER run, drops the detached one', () => {
+  const rowYs = [0, 10, 20, 30, 40, 50, 60]; // 6 rows
+  const desc = { rowYs, colXs: [0, 50, 100], left: 0, right: 100, top: 0, bottom: 60 };
+  // interior rule over rows 0..2 (run of 3) and rows 4..5 (run of 2); row 3 is a gap band
+  const segs = [vseg(0, 0, 60), vseg(100, 0, 60), vseg(50, 0, 30), vseg(50, 40, 60)];
+  const out = trimTableToGridCore(desc, segs);
+  assert.deepEqual(out.rowYs, [0, 10, 20, 30], 'kept the 3-row leading run');
+  assert.equal(out.bottom, 30);
 });
 
 // ── E-15: content-occupancy test for detected tables ────────────────────────
@@ -902,6 +967,88 @@ test('P1 classifyImagePlacement: recurring but NOT full-width (small logo) → n
   const { roles, bandFound } = classifyImagePlacement([small(1), small(2), small(3)], 3);
   assert.equal(bandFound, false);
   assert.deepEqual(roles, ['inline', 'inline', 'inline']);
+});
+
+// ── Phase E colour capture (render-only channel) ─────────────────────────────
+// Glyph fill colour → run.color; cell fill → cell.shading; with WHITE-ON-COLOUR
+// SAFETY (a run that would render invisibly on its true background falls back to
+// the visible extreme). Pure-helper synthetic tests — no pdfjs / real PDF, and
+// colour NEVER touches table detection. Same style as the E-15 / E-24 tests.
+
+test('colour rgbToHex / hexToRgb round-trip + luminance ordering', () => {
+  assert.equal(rgbToHex([0, 0, 0]), '000000');
+  assert.equal(rgbToHex([1, 1, 1]), 'FFFFFF');
+  assert.equal(rgbToHex([0.227, 0.149, 0.471]), '3A2678'); // indigo
+  const rt = hexToRgb('3A2678');
+  assert.ok(Math.abs(rt[0] - 0.227) < 0.01 && Math.abs(rt[1] - 0.149) < 0.01 && Math.abs(rt[2] - 0.471) < 0.01);
+  assert.ok(colorLuminance([1, 1, 1]) > colorLuminance([0.227, 0.149, 0.471]));
+  assert.equal(hexToRgb('zz'), null);
+});
+
+test('colour isNearBlack: pure/near black yes, indigo no', () => {
+  assert.equal(isNearBlack([0, 0, 0]), true);
+  assert.equal(isNearBlack([0.02, 0.02, 0.02]), true);
+  assert.equal(isNearBlack([0.227, 0.149, 0.471]), false);
+});
+
+test('WHITE-ON-COLOUR SAFETY safeRunColor: keep visible, flip the invisible', () => {
+  const WHITE = [1, 1, 1], INDIGO = hexToRgb('3A2678'), NAVY = hexToRgb('1B2B4B');
+  assert.equal(safeRunColor('FFFFFF', WHITE), undefined);   // white on white page → black fallback
+  assert.equal(safeRunColor('FFFFFF', INDIGO), 'FFFFFF');   // white on dark cell → kept
+  assert.equal(safeRunColor('3A2678', WHITE), '3A2678');    // indigo on white → kept
+  assert.equal(safeRunColor('D85A30', WHITE), 'D85A30');    // coral on white → kept
+  assert.equal(safeRunColor('0F8C74', WHITE), '0F8C74');    // teal on white → kept
+  assert.equal(safeRunColor(undefined, NAVY), 'FFFFFF');    // default-black on dark → flip to white
+  assert.equal(safeRunColor(undefined, WHITE), undefined);  // default-black on white → unchanged
+});
+
+test('colour assignGlyphColors: glyph takes its line-run colour; near-black stays uncoloured', () => {
+  const glyphs = [{ baseTop: 100, xLeft: 72 }, { baseTop: 120, xLeft: 72 }, { baseTop: 100, xLeft: 200 }];
+  const textColors = [
+    { yTop: 100, x: 72, color: hexToRgb('D85A30') }, // coral line
+    { yTop: 120, x: 72, color: [0, 0, 0] },          // black line
+  ];
+  assignGlyphColors(glyphs, textColors);
+  assert.equal(glyphs[0].color, 'D85A30');
+  assert.equal(glyphs[1].color, undefined); // near-black → no explicit colour
+  assert.equal(glyphs[2].color, 'D85A30');  // same line, right of the coral origin
+});
+
+test('colour assignGlyphColors: multi-colour line — glyph takes the nearest PRECEDING origin', () => {
+  const glyphs = [{ baseTop: 100, xLeft: 80 }, { baseTop: 100, xLeft: 260 }];
+  const textColors = [
+    { yTop: 100, x: 72, color: [0, 0, 0] },           // black label, left
+    { yTop: 100, x: 250, color: hexToRgb('0F8C74') }, // teal value, right
+  ];
+  assignGlyphColors(glyphs, textColors);
+  assert.equal(glyphs[0].color, undefined); // black label
+  assert.equal(glyphs[1].color, '0F8C74');  // teal value
+});
+
+test('colour cellShadingFor: point in coloured fill → hex; ~white → none; smallest enclosing wins', () => {
+  const band = { rect: { x0: 0, y0: 0, x1: 500, y1: 100, width: 500, height: 100 }, fill: hexToRgb('3A2678') };
+  const tint = { rect: { x0: 50, y0: 10, x1: 200, y1: 40, width: 150, height: 30 }, fill: hexToRgb('E8E5F6') };
+  const white = { rect: { x0: 0, y0: 200, x1: 500, y1: 260, width: 500, height: 60 }, fill: [1, 1, 1] };
+  assert.equal(cellShadingFor(300, 60, [band]), '3A2678');
+  assert.equal(cellShadingFor(100, 25, [band, tint]), 'E8E5F6'); // smallest enclosing wins
+  assert.equal(cellShadingFor(250, 230, [white]), undefined);    // ~white → no tint
+  assert.equal(cellShadingFor(999, 999, [band]), undefined);     // outside everything
+});
+
+test('WHITE-ON-COLOUR SAFETY applyColorContrastSafety: paragraph (white) vs shaded-cell backgrounds', () => {
+  const structure = [
+    { type: 'paragraph', runs: [{ text: 'heading', color: 'FFFFFF' }] }, // white on white page
+    { type: 'paragraph', runs: [{ text: 'sub', color: '3A2678' }] },     // indigo on white page
+    { type: 'table', rows: [{ cells: [
+      { shading: '3A2678', content: [{ type: 'paragraph', runs: [{ text: 'Domain', color: 'FFFFFF' }] }] },
+      { content: [{ type: 'paragraph', runs: [{ text: '18' }] }] },
+    ] }] },
+  ];
+  applyColorContrastSafety(structure);
+  assert.equal(structure[0].runs[0].color, undefined);  // white→white: fell back to black (deleted)
+  assert.equal(structure[1].runs[0].color, '3A2678');   // indigo on white: kept
+  assert.equal(structure[2].rows[0].cells[0].content[0].runs[0].color, 'FFFFFF'); // white on indigo cell: kept
+  assert.equal(structure[2].rows[0].cells[1].content[0].runs[0].color, undefined); // black on white: unchanged
 });
 
 // ── E-24 end-to-end against REAL PDFs (fixture-gated, PII-safe) ────────────────
