@@ -2417,7 +2417,11 @@ You output ONLY the JSON array. No prose, no markdown, no commentary. The output
   }
 ]`;
 
-const { FORMAT_DRAFT_SLOT_ADDENDUM } = require('./lib/draftSlotAddendum');
+const {
+  FORMAT_DRAFT_SLOT_ADDENDUM,
+  FORMAT_DRAFT_SLOT_ADDENDUM_VERSION,
+  FORMAT_DRAFT_SLOT_ADDENDUM_HASH,
+} = require('./lib/draftSlotAddendum');
 
 app.post('/format-draft', requireAuth, async (req, res) => {
   try {
@@ -2563,6 +2567,16 @@ app.post('/format-draft', requireAuth, async (req, res) => {
         format_type:   lt.format_type || '',
         section_count: Array.isArray(lt.sections) ? lt.sections.length : 0,
       },
+      // Prompt drift detection for the slot-fill addendum (B-min versioning).
+      // Only meaningful when slot-fill mode was active — the addendum is the
+      // only versioned-and-hashed prompt artifact in this handler; the base
+      // FORMAT_DRAFT_SYSTEM_PROMPT remains unversioned (pre-existing gap).
+      slot_addendum_version_snapshot: slotFill
+        ? {
+            version:     FORMAT_DRAFT_SLOT_ADDENDUM_VERSION,
+            prompt_hash: FORMAT_DRAFT_SLOT_ADDENDUM_HASH,
+          }
+        : null,
     };
 
     // ── Phase D — atomic persistence: format_drafts + format_draft_sentences ──

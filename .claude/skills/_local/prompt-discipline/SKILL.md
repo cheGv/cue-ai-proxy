@@ -21,6 +21,8 @@ LLM responses parsed and persisted use a structured/JSON schema, not regex on fr
 When the model lacks grounding, it returns a structured "not documented" / insufficient-info response (`clinical-invariants`) — never silently coerced to empty string, null, or a fabricated default downstream.
 ### A5. AI success bar
 SLPs edit <10% of generated content. High edit rate = the prompt is failing the Product Law (making the SLP redo the system's work). Treat rising edit rate as a prompt bug.
+### A6. Hard facts are placed, not inferred
+A hard clinical fact (diagnosis, age, score, date) may only be emitted if present as an explicit value in canonical_data. It is never inferred from structural or adjacent signals — most critically, a routing/triage label (e.g. assessment.protocol) is never a source for a diagnosis. Absent an explicit source, the slot stays empty. Guards the protocol->diagnosis leak (observed: pediatric-cas written as a stated diagnosis with no clinician entry). The executing guard lives in the slot-fill prompt; this is the principle it answers to. Doctrinal parent: `_shared/clinical-invariants` (anti-hallucination).
 ## Prompt review discipline (§16.1)
 Every system prompt gets a **partner-mode review pass before deploy.** Review covers:
 - enum coverage gaps
